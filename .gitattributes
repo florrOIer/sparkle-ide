@@ -1,0 +1,11 @@
+# 仓库同时给 Windows 用户直接用，统一按 CRLF 检出，避免换行符污染 diff
+* text=auto eol=crlf
+
+# 二进制资源不做任何转换
+*.exe binary
+*.dll binary
+*.pak binary
+*.bin binary
+*.dat binary
+*.7z binary
+*.zip binary

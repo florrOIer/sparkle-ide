@@ -1,0 +1,26 @@
+# ── Electron 运行时（完整便携包走 GitHub Releases，不进 git）──
+/Sparkle IDE.exe
+/*.dll
+/*.pak
+/*.bin
+/*.dat
+/vk_swiftshader_icd.json
+/version
+/locales/
+
+# ── 预装工具链 GCC 12.2.0（647 MB，走 Releases）──
+/resources/app/toolchains/
+
+# ── 运行期产物 ──
+/log/
+*.log
+
+# ── 补丁过程备份（开发中间态，非分发内容）──
+/.backup-*/
+/resources/app/.backup-*/
+*.bak*
+
+# ── 系统杂物 ──
+desktop.ini
+Thumbs.db
+.DS_Store

@@ -1,0 +1,10 @@
+{
+  "id": "sparkle.slow-provider",
+  "name": "慢速补全（用于验证取消）",
+  "version": "1.0.0",
+  "description": "故意耗时很久才返回补全，用来验证取消令牌真的从编辑器一路传到了插件手里。只针对 JavaScript，避免影响 Python 的正常补全。",
+  "main": "index.js",
+  "activation": ["onLanguage:javascript"],
+  "permissions": [],
+  "contributes": { "commands": [] }
+}

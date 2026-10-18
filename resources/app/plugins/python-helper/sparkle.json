@@ -1,0 +1,12 @@
+{
+  "id": "sparkle.python-helper",
+  "name": "Python 初学者助手",
+  "version": "1.0.0",
+  "description": "为 Python 提供初学者最常用的补全。刻意不申请任何权限 —— 提供补全本来就不需要读文件或联网。",
+  "main": "index.js",
+  "activation": ["onLanguage:python"],
+  "permissions": [],
+  "contributes": {
+    "commands": [{ "id": "pythonHelper.about", "title": "关于 Python 初学者助手" }]
+  }
+}

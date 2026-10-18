@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sparkle IDE</title>
+    <!--
+      TODO(P2 插件沙箱): 主窗口需要一条严格 CSP。
+      插件窗口（独立 BrowserWindow + app:// 独立 origin）必须带
+      default-src 'none' 起步的 CSP，这是权限模型的第一道防线。
+      主窗口在开发期保留宽松策略，以免挡住 Vite HMR 的 ws 连接。
+    -->
+    <script type="module" crossorigin src="./assets/index-B_8TZfty.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BY_dBreY.css">
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>

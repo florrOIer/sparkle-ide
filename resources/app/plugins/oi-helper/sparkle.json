@@ -1,0 +1,10 @@
+{
+  "id": "sparkle.oi-helper",
+  "name": "OI-Helper",
+  "version": "1.0.0",
+  "description": "算法与数据结构可视化：线段树、树状数组、最短路、缩点、拓扑排序、最小生成树、树形 DP、背包，以及数列规律寻找。零权限。",
+  "main": "index.js",
+  "activation": ["onSolverPanel"],
+  "permissions": [],
+  "contributes": { "commands": [] }
+}

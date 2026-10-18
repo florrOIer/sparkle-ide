@@ -1,0 +1,10 @@
+{
+  "id": "sparkle.perm-probe",
+  "name": "权限探针",
+  "version": "1.0.0",
+  "description": "激活时故意用未授权的权限去读工作区文件，用来验证主进程确实会拒绝、而不是只写在文档上。",
+  "main": "index.js",
+  "activation": [],
+  "permissions": [],
+  "contributes": { "commands": [] }
+}

@@ -4283,7 +4283,10 @@ var SETTINGS_DEFAULTS = {
 	renderWhitespace: "none",
 	restoreWorkspace: true,
 	lastWorkspaceRoot: "",
-	cppStandard: ""
+	cppStandard: "",
+	language: "zh",
+	uiTheme: "dark",
+	ideTheme: "native"
 };
 var settingsCache = null;
 function readSettingsFile() {
@@ -4322,6 +4325,12 @@ function sanitizeSetting(key, value) {
 			return typeof value === "string" && value.length > 0 && value.length <= 260 ? value : "";
 		case "cppStandard":
 			return ["", "auto", "c++11", "c++14", "c++17", "c++20", "c++23", "c++26"].includes(value) ? value : "";
+		case "language":
+			return ["zh", "en"].includes(value) ? value : void 0;
+		case "uiTheme":
+			return ["light", "dark"].includes(value) ? value : void 0;
+		case "ideTheme":
+			return ["native", "codeblocks", "devcpp", "geany"].includes(value) ? value : void 0;
 		default:
 			return void 0;
 	}

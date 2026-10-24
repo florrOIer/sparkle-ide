@@ -9,3 +9,11 @@
 *.dat binary
 *.7z binary
 *.zip binary
+
+# ---- GitHub 语言统计（linguist）----
+# 20 MB 的 Chromium 第三方许可证文本会把仓库语言顶成 HTML，排除出统计
+LICENSES.chromium.html linguist-documentation
+# 文档不计入语言占比
+*.md linguist-documentation
+*.txt linguist-documentation
+

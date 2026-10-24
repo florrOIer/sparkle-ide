@@ -966,7 +966,7 @@ ${JSON.stringify(i,null,2)}`);return t.value}}async notify(e,t,n){if(!this.check
 可以在行号左边点断点，然后点「▶ 调试」。`:`
 
 点「编译并运行」会在新窗口里打开它（结束后会停住等你按回车）。`)):p9.value=a.output||`（编译器没有输出，但也没有生成产物）`,a}catch(e){return m9.value=e instanceof Error?e.message:String(e),null}finally{g9.value=!1}}async function UXe(e){let t=window.sparkle?.ide;if(!t||!e)return;let n=e.toLowerCase().endsWith(`.py`)?`python`:`cpp`,r=e.includes(`/`)?e.slice(0,e.lastIndexOf(`/`)):``;if(n!==`cpp`||d9.value===e||(await v9(e))?.ok){g9.value=!0;try{let i=await t.runInConsole({executable:n===`python`?e:u9.value??``,directory:r,language:n});p9.value+=`\n──────── 运行 ────────\n${i.message}`,i.ok||(m9.value=i.message)}catch(e){m9.value=e instanceof Error?e.message:String(e)}finally{g9.value=!1}}}async function WXe(e){if(!e)return;let t=await v9(e);t?.ok&&(t.executable||e.toLowerCase().endsWith(`.py`))&&await UXe(e)}async function GXe(e){let t=window.sparkle?.ide;if(!t||!e)return;o9.value=``,s9.value=[],c9.value=null,l9.value=``;let n=await v9(e,{debug:!0});if(!n?.ok||!n.executable){l9.value=n?.friendlyError??`编译失败，无法开始调试。`,a9.value=`error`;return}let r=e.includes(`/`)?e.slice(0,e.lastIndexOf(`/`)):``,i=await t.debugStart({executable:n.executable,directory:r,breakpoints:zXe()});i.ok||(a9.value=`error`,l9.value=i.error??`调试启动失败。`)}async function KXe(e){await window.sparkle?.ide?.debugCommand(e)}async function qXe(){await window.sparkle?.ide?.debugStop(),a9.value=`idle`}function y9(){return{breakpoints:i9,breakpointCount:FXe,state:a9,output:o9,variables:s9,pauseLocation:c9,message:l9,lastExecutable:u9,buildOutput:p9,buildFriendlyError:m9,buildDurationMs:h9,busy:g9,buildMode:f9,setBuildMode:PXe,toggleBreakpoint:IXe,clearBreakpoints:LXe,linesFor:RXe,watchDebug:VXe,stopWatchingDebug:HXe,compileCurrentFile:v9,runCurrentFile:UXe,compileAndRunCurrentFile:WXe,startDebug:GXe,debugCommand:KXe,stopDebug:qXe}}var JXe=an(0),YXe=an(0),XXe=an(0),ZXe=an(0);function QXe(){JXe.value+=1}function $Xe(){YXe.value+=1}function b9(){XXe.value+=1}function eZe(){ZXe.value+=1}function x9(){return{findRequest:JXe,replaceRequest:YXe,toggleBreakpointRequest:XXe,projectBuildRequest:ZXe,requestFind:QXe,requestReplace:$Xe,requestToggleBreakpoint:b9,requestProjectBuild:eZe}}function tZe(e){return new Worker(new URL(`editor.worker-BmdWdrHZ.js`,import.meta.url).href,{name:e?.name})}function nZe(e){return new Worker(new URL(`json.worker-DdeUAmHa.js`,import.meta.url).href,{name:e?.name})}function rZe(e){return new Worker(new URL(`css.worker-C6lDtRpF.js`,import.meta.url).href,{name:e?.name})}function iZe(e){return new Worker(new URL(`html.worker-C5yZDBHz.js`,import.meta.url).href,{name:e?.name})}function aZe(e){return new Worker(new URL(`ts.worker-DGGa2mF8.js`,import.meta.url).href,{name:e?.name})}var S9=`sparkle-analyzer`,oZe=`sparkle-dark`,sZe=20,cZe=la(Gn({__name:`CodeEditor`,props:{modelValue:{default:``},language:{default:`plaintext`},readOnly:{type:Boolean,default:!1},pluginLanguages:{default:()=>[]},docId:{default:``}},emits:[`update:modelValue`,`cursor`,`ready`],setup(e,{expose:t,emit:n}){globalThis.MonacoEnvironment={getWorker(e,t){switch(t){case`json`:return new nZe;case`css`:case`scss`:case`less`:return new rZe;case`html`:case`handlebars`:case`razor`:return new iZe;case`typescript`:case`javascript`:return new aZe;default:return new tZe}}};let r=e,i=n,a=an(null),o=on(null),s=null,c=null,{diagnostics:l,analyzedDocId:u}=CXe(),{pendingReveal:d}=TXe(),{linesFor:f,toggleBreakpoint:p,breakpoints:m}=y9(),{findRequest:h,replaceRequest:g,toggleBreakpointRequest:_}=x9();function v(){let e=o.value,t=e?.getModel();if(!e||!t)return;let n=(r.docId?f(r.docId):[]).filter(e=>e>=1&&e<=t.getLineCount()).map(e=>({range:new pYe(e,1,e,1),options:{isWholeLine:!1,glyphMarginClassName:`sparkle-breakpoint`,glyphMarginHoverMessage:{value:`断点：第 ${e} 行（点一下可以取消）`}}}));e.deltaDecorations(y,[]),y=e.deltaDecorations([],n)}let y=[],b=null;function x(){let e=d.value,t=o.value;if(!e||!t||e.path!==r.docId)return;let n=t.getModel();if(!n)return;let i=Math.min(Math.max(1,e.line),n.getLineCount()),a=Math.min(Math.max(1,e.column),n.getLineMaxColumn(i));t.revealLineInCenter(i),t.setPosition({lineNumber:i,column:a}),t.focus(),wXe()}function S(){return r.language===`python`||r.language===`javascript`?r.language:null}function C(){let e=o.value?.getModel();e&&r7.setModelMarkers(e,S9,[])}let ee={error:t7.Error,warning:t7.Warning,info:t7.Info};function te(e,t){let n=t.getLineCount(),r=Math.min(Math.max(1,e.line),n),i=t.getLineMaxColumn(r),a=Math.min(Math.max(1,e.column),i),o=Math.min(Math.max(a,e.endColumn),i);return{severity:ee[e.severity],message:e.hint?`${e.message}\n\n提示：${e.hint}`:e.message,startLineNumber:r,startColumn:a,endLineNumber:r,endColumn:o,code:e.code,source:`Sparkle 分析器`}}function ne(){let e=o.value;if(!e)return;let t=e.getModel();if(t){if(!r.docId||u.value!==r.docId)r7.setModelMarkers(t,S9,[]);else try{r7.setModelMarkers(t,S9,l.value.map(e=>te(e,t)))}catch(e){console.warn(`设置诊断标记失败：`,e)}}}let re={text:i7.CompletionItemKind.Text,method:i7.CompletionItemKind.Method,function:i7.CompletionItemKind.Function,variable:i7.CompletionItemKind.Variable,class:i7.CompletionItemKind.Class,keyword:i7.CompletionItemKind.Keyword,snippet:i7.CompletionItemKind.Snippet};function ie(){let e=globalThis.crypto;return e&&typeof e.randomUUID==`function`?e.randomUUID():`req-${Date.now()}-${Math.random().toString(36).slice(2)}`}let ae=[];function oe(){for(let e of ae)e.dispose();ae=[]}function se(){if(oe(),window.sparkle?.plugin)for(let e of r.pluginLanguages)ae.push(i7.registerCompletionItemProvider(e,{provideCompletionItems:(t,n,r,i)=>ce(t,n,i,e)}))}async function ce(e,t,n,r){let i=window.sparkle?.plugin;if(!i||n.isCancellationRequested)return{suggestions:[]};let a=ie(),o=n.onCancellationRequested(()=>{i.cancel(a)});try{let o=e.getWordUntilPosition(t),s={startLineNumber:t.lineNumber,endLineNumber:t.lineNumber,startColumn:o.startColumn,endColumn:o.endColumn},c=Math.max(1,t.lineNumber-sZe),l=e.getValueInRange({startLineNumber:c,startColumn:1,endLineNumber:t.lineNumber,endColumn:t.column}).split(`
-`),u=l[l.length-1]??``,d=await i.provideCompletions({requestId:a,languageId:r,context:{languageId:r,linePrefix:u,lineNumber:t.lineNumber,precedingLines:l.slice(0,-1)}});return n.isCancellationRequested?{suggestions:[]}:{suggestions:d.items.map(e=>({label:e.label,kind:re[e.kind??`text`]??i7.CompletionItemKind.Text,detail:e.detail,documentation:e.documentation,insertText:e.insertText??e.label,range:s}))}}catch{return{suggestions:[]}}finally{o.dispose()}}function le(){r7.defineTheme(oZe,{base:`vs-dark`,inherit:!0,rules:[],colors:{"editor.background":`#1f1f1f`,"editorGutter.background":`#1f1f1f`,"editor.lineHighlightBackground":`#2a2d2e`,"editorLineNumber.foreground":`#6e7681`,"editorLineNumber.activeForeground":`#cccccc`,"editorIndentGuide.background1":`#2b2b2b`,"editorWidget.background":`#202020`,"editorWidget.border":`#2b2b2b`}})}return nr(()=>{let e=a.value;if(!e)return;le();let t=r7.create(e,{value:r.modelValue,language:r.language,theme:oZe,readOnly:r.readOnly,automaticLayout:!0,fontSize:SparkleSettings.get().fontSize,lineHeight:Math.round(SparkleSettings.get().fontSize*10/7),fontFamily:SparkleSettings.get().fontFamily,minimap:{enabled:SparkleSettings.get().minimap,renderCharacters:!1},glyphMargin:!0,scrollBeyondLastLine:!1,smoothScrolling:SparkleSettings.get().smoothScrolling,cursorBlinking:SparkleSettings.get().cursorBlinking,renderLineHighlight:`all`,tabSize:SparkleSettings.get().tabSize,fixedOverflowWidgets:!0,wordWrap:SparkleSettings.get().wordWrap,renderWhitespace:SparkleSettings.get().renderWhitespace,lineNumbers:SparkleSettings.get().lineNumbers?`on`:`off`});o.value=t,Ln(()=>SparkleSettingsState.value,()=>{let e=o.value;if(!e)return;let t=SparkleSettings.get();try{e.updateOptions({fontSize:t.fontSize,lineHeight:Math.round(t.fontSize*10/7),fontFamily:t.fontFamily,minimap:{enabled:t.minimap,renderCharacters:!1},smoothScrolling:t.smoothScrolling,cursorBlinking:t.cursorBlinking,tabSize:t.tabSize,wordWrap:t.wordWrap,renderWhitespace:t.renderWhitespace,lineNumbers:t.lineNumbers?`on`:`off`})}catch{}},{deep:!0}),b=t.onMouseDown(e=>{if(e.target.type!==r7.MouseTargetType.GUTTER_GLYPH_MARGIN)return;let t=e.target.position?.lineNumber;t&&r.docId&&p(r.docId,t)}),Ln(h,()=>{o.value?.getAction(`actions.find`)?.run()}),Ln(g,()=>{o.value?.getAction(`editor.action.startFindReplaceAction`)?.run()}),Ln(_,()=>{let e=o.value,t=e?.getPosition();e&&t&&r.docId&&p(r.docId,t.lineNumber)}),s=t.onDidChangeModelContent(()=>{let e=t.getValue();i(`update:modelValue`,e);let n=S();n&&r.docId&&xXe(r.docId,e,n)}),c=t.onDidChangeCursorPosition(e=>{i(`cursor`,{line:e.position.lineNumber,column:e.position.column})}),se();let n=S();n&&r.docId&&V7(r.docId,t.getValue(),n),i(`ready`)}),rr(()=>{oe(),C(),b?.dispose(),s?.dispose(),s=null,c?.dispose(),c=null,o.value?.dispose(),o.value=null}),Ln(()=>r.language,e=>{let t=o.value?.getModel();t&&r7.setModelLanguage(t,e)}),Ln(()=>r.pluginLanguages,()=>se(),{deep:!0}),Ln(l,()=>ne()),Ln(u,()=>ne()),Ln(m,()=>v(),{deep:!0}),Ln(()=>r.docId,async()=>{await Cn(),v()}),Ln(d,async()=>{await Cn(),x()}),Ln(()=>r.docId,async()=>{await Cn(),x()}),Ln(()=>[r.docId,r.language],()=>{C();let e=S(),t=o.value;e&&r.docId&&t&&V7(r.docId,t.getValue(),e)}),Ln(()=>r.readOnly,e=>{o.value?.updateOptions({readOnly:e})}),Ln(()=>r.modelValue,e=>{let t=o.value;t&&e!==t.getValue()&&t.setValue(e??``)}),t({getEditor:()=>o.value}),(e,t)=>(E(),D(`div`,{ref_key:`hostRef`,ref:a,class:`monaco-host`},null,512))}}),[[`__scopeId`,`data-v-12d74180`]]),lZe=`    `,uZe=new Set(`False.None.True.and.as.assert.async.await.break.class.continue.def.del.elif.else.except.finally.for.from.global.if.import.in.is.lambda.nonlocal.not.or.pass.raise.return.try.while.with.yield`.split(`.`)),dZe=/^[\p{L}_][\p{L}\p{N}_]*$/u;function C9(e){let t=e.trim();return t?uZe.has(t)?`"${t}" 是 Python 关键字，不能用作变量名`:dZe.test(t)?null:`"${t}" 不是合法变量名：只能用字母、数字、下划线，且不能以数字开头`:`变量名不能为空`}function fZe(e){return`"${e.replace(/\\/g,`\\\\`).replace(/"/g,`\\"`).replace(/\n/g,`\\n`).replace(/\r/g,`\\r`).replace(/\t/g,`\\t`)}"`}var pZe=0;function w9(e=`n`){return pZe+=1,`${e}${pZe}`}function mZe(e){switch(e){case`print`:return{id:w9(`print`),kind:`print`,mode:`text`,value:`你好，Sparkle！`};case`set`:return{id:w9(`set`),kind:`set`,name:`计数`,value:`0`};case`math`:return{id:w9(`math`),kind:`math`,name:`计数`,left:`计数`,op:`+`,right:`1`};case`repeat`:return{id:w9(`repeat`),kind:`repeat`,times:`3`,varName:`i`,body:[]}}}function hZe(){return{nodes:[{id:w9(`set`),kind:`set`,name:`计数`,value:`0`},{id:w9(`repeat`),kind:`repeat`,times:`3`,varName:`i`,body:[{id:w9(`math`),kind:`math`,name:`计数`,left:`计数`,op:`+`,right:`1`},{id:w9(`print`),kind:`print`,mode:`expr`,value:`"第 " + str(i + 1) + " 次，计数 = " + str(计数)`}]},{id:w9(`print`),kind:`print`,mode:`expr`,value:`"结束，最终计数 = " + str(计数)`}]}}var T9={print:`输出`,set:`设置变量`,math:`计算`,repeat:`重复`};function gZe(e){let t=e.trim();return/^[\p{L}_][\p{L}\p{N}_]*$/u.test(t)||/^-?\d+(\.\d+)?$/.test(t)?t:`(${t})`}function _Ze(e,t,n,r){let i=lZe.repeat(t);for(let a of e)switch(a.kind){case`print`:{let e=a.value??``;if(!e.trim()){n.push({nodeId:a.id,message:`输出内容为空`}),r.push(`${i}print("")`);break}r.push(a.mode===`text`?`${i}print(${fZe(e)})`:`${i}print(${e})`);break}case`set`:{let e=C9(a.name??``);e&&n.push({nodeId:a.id,message:`设置变量：${e}`});let t=(a.value??``).trim();t||n.push({nodeId:a.id,message:`设置变量：值不能为空`}),r.push(`${i}${(a.name??``).trim()||`变量`} = ${t||`0`}`);break}case`math`:{let e=C9(a.name??``);e&&n.push({nodeId:a.id,message:`计算：${e}`});let t=(a.left??``).trim(),o=(a.right??``).trim();t||n.push({nodeId:a.id,message:`计算：左值不能为空`}),o||n.push({nodeId:a.id,message:`计算：右值不能为空`}),r.push(`${i}${(a.name??``).trim()||`变量`} = ${gZe(t||`0`)} ${a.op} ${gZe(o||`1`)}`);break}case`repeat`:{let e=C9(a.varName??``);e&&n.push({nodeId:a.id,message:`重复：${e}`});let o=(a.times??``).trim();o||n.push({nodeId:a.id,message:`重复：次数不能为空`}),r.push(`${i}for ${(a.varName??``).trim()||`i`} in range(${o||`0`}):`),a.body.length===0?r.push(`${i}${lZe}pass`):_Ze(a.body,t+1,n,r);break}}}function vZe(e){let t=[],n=[];return n.push(`# 本文件由 Sparkle IDE 节点图自动生成`),n.push(``),e.nodes.length===0?(n.push(`# 画布是空的：请先添加一个节点`),{code:n.join(`
+`),u=l[l.length-1]??``,d=await i.provideCompletions({requestId:a,languageId:r,context:{languageId:r,linePrefix:u,lineNumber:t.lineNumber,precedingLines:l.slice(0,-1)}});return n.isCancellationRequested?{suggestions:[]}:{suggestions:d.items.map(e=>({label:e.label,kind:re[e.kind??`text`]??i7.CompletionItemKind.Text,detail:e.detail,documentation:e.documentation,insertText:e.insertText??e.label,range:s}))}}catch{return{suggestions:[]}}finally{o.dispose()}}function le(){r7.defineTheme(`sparkle-light`,{base:`vs`,inherit:!0,rules:[],colors:{"editor.background":`#ffffff`,"editorGutter.background":`#f8f8f8`,"editor.lineHighlightBackground":`#f0f0f0`,"editorLineNumber.foreground":`#9aa0a6`,"editorLineNumber.activeForeground":`#333333`,"editorIndentGuide.background1":`#e5e5e5`,"editorWidget.background":`#ffffff`,"editorWidget.border":`#d4d4d4`}});r7.defineTheme(oZe,{base:`vs-dark`,inherit:!0,rules:[],colors:{"editor.background":`#1f1f1f`,"editorGutter.background":`#1f1f1f`,"editor.lineHighlightBackground":`#2a2d2e`,"editorLineNumber.foreground":`#6e7681`,"editorLineNumber.activeForeground":`#cccccc`,"editorIndentGuide.background1":`#2b2b2b`,"editorWidget.background":`#202020`,"editorWidget.border":`#2b2b2b`}})}return nr(()=>{let e=a.value;if(!e)return;le();let t=(window.__sparkleMonaco=r7).create(e,{value:r.modelValue,language:r.language,theme:window.__sparkleEditorTheme?window.__sparkleEditorTheme(oZe):oZe,readOnly:r.readOnly,automaticLayout:!0,fontSize:SparkleSettings.get().fontSize,lineHeight:Math.round(SparkleSettings.get().fontSize*10/7),fontFamily:SparkleSettings.get().fontFamily,minimap:{enabled:SparkleSettings.get().minimap,renderCharacters:!1},glyphMargin:!0,scrollBeyondLastLine:!1,smoothScrolling:SparkleSettings.get().smoothScrolling,cursorBlinking:SparkleSettings.get().cursorBlinking,renderLineHighlight:`all`,tabSize:SparkleSettings.get().tabSize,fixedOverflowWidgets:!0,wordWrap:SparkleSettings.get().wordWrap,renderWhitespace:SparkleSettings.get().renderWhitespace,lineNumbers:SparkleSettings.get().lineNumbers?`on`:`off`});o.value=t,Ln(()=>SparkleSettingsState.value,()=>{let e=o.value;if(!e)return;let t=SparkleSettings.get();try{e.updateOptions({fontSize:t.fontSize,lineHeight:Math.round(t.fontSize*10/7),fontFamily:t.fontFamily,minimap:{enabled:t.minimap,renderCharacters:!1},smoothScrolling:t.smoothScrolling,cursorBlinking:t.cursorBlinking,tabSize:t.tabSize,wordWrap:t.wordWrap,renderWhitespace:t.renderWhitespace,lineNumbers:t.lineNumbers?`on`:`off`});try{window.__sparkleApplyEditorTheme&&window.__sparkleApplyEditorTheme()}catch{}}catch{}},{deep:!0}),b=t.onMouseDown(e=>{if(e.target.type!==r7.MouseTargetType.GUTTER_GLYPH_MARGIN)return;let t=e.target.position?.lineNumber;t&&r.docId&&p(r.docId,t)}),Ln(h,()=>{o.value?.getAction(`actions.find`)?.run()}),Ln(g,()=>{o.value?.getAction(`editor.action.startFindReplaceAction`)?.run()}),Ln(_,()=>{let e=o.value,t=e?.getPosition();e&&t&&r.docId&&p(r.docId,t.lineNumber)}),s=t.onDidChangeModelContent(()=>{let e=t.getValue();i(`update:modelValue`,e);let n=S();n&&r.docId&&xXe(r.docId,e,n)}),c=t.onDidChangeCursorPosition(e=>{i(`cursor`,{line:e.position.lineNumber,column:e.position.column})}),se();let n=S();n&&r.docId&&V7(r.docId,t.getValue(),n),i(`ready`)}),rr(()=>{oe(),C(),b?.dispose(),s?.dispose(),s=null,c?.dispose(),c=null,o.value?.dispose(),o.value=null}),Ln(()=>r.language,e=>{let t=o.value?.getModel();t&&r7.setModelLanguage(t,e)}),Ln(()=>r.pluginLanguages,()=>se(),{deep:!0}),Ln(l,()=>ne()),Ln(u,()=>ne()),Ln(m,()=>v(),{deep:!0}),Ln(()=>r.docId,async()=>{await Cn(),v()}),Ln(d,async()=>{await Cn(),x()}),Ln(()=>r.docId,async()=>{await Cn(),x()}),Ln(()=>[r.docId,r.language],()=>{C();let e=S(),t=o.value;e&&r.docId&&t&&V7(r.docId,t.getValue(),e)}),Ln(()=>r.readOnly,e=>{o.value?.updateOptions({readOnly:e})}),Ln(()=>r.modelValue,e=>{let t=o.value;t&&e!==t.getValue()&&t.setValue(e??``)}),t({getEditor:()=>o.value}),(e,t)=>(E(),D(`div`,{ref_key:`hostRef`,ref:a,class:`monaco-host`},null,512))}}),[[`__scopeId`,`data-v-12d74180`]]),lZe=`    `,uZe=new Set(`False.None.True.and.as.assert.async.await.break.class.continue.def.del.elif.else.except.finally.for.from.global.if.import.in.is.lambda.nonlocal.not.or.pass.raise.return.try.while.with.yield`.split(`.`)),dZe=/^[\p{L}_][\p{L}\p{N}_]*$/u;function C9(e){let t=e.trim();return t?uZe.has(t)?`"${t}" 是 Python 关键字，不能用作变量名`:dZe.test(t)?null:`"${t}" 不是合法变量名：只能用字母、数字、下划线，且不能以数字开头`:`变量名不能为空`}function fZe(e){return`"${e.replace(/\\/g,`\\\\`).replace(/"/g,`\\"`).replace(/\n/g,`\\n`).replace(/\r/g,`\\r`).replace(/\t/g,`\\t`)}"`}var pZe=0;function w9(e=`n`){return pZe+=1,`${e}${pZe}`}function mZe(e){switch(e){case`print`:return{id:w9(`print`),kind:`print`,mode:`text`,value:`你好，Sparkle！`};case`set`:return{id:w9(`set`),kind:`set`,name:`计数`,value:`0`};case`math`:return{id:w9(`math`),kind:`math`,name:`计数`,left:`计数`,op:`+`,right:`1`};case`repeat`:return{id:w9(`repeat`),kind:`repeat`,times:`3`,varName:`i`,body:[]}}}function hZe(){return{nodes:[{id:w9(`set`),kind:`set`,name:`计数`,value:`0`},{id:w9(`repeat`),kind:`repeat`,times:`3`,varName:`i`,body:[{id:w9(`math`),kind:`math`,name:`计数`,left:`计数`,op:`+`,right:`1`},{id:w9(`print`),kind:`print`,mode:`expr`,value:`"第 " + str(i + 1) + " 次，计数 = " + str(计数)`}]},{id:w9(`print`),kind:`print`,mode:`expr`,value:`"结束，最终计数 = " + str(计数)`}]}}var T9={print:`输出`,set:`设置变量`,math:`计算`,repeat:`重复`};function gZe(e){let t=e.trim();return/^[\p{L}_][\p{L}\p{N}_]*$/u.test(t)||/^-?\d+(\.\d+)?$/.test(t)?t:`(${t})`}function _Ze(e,t,n,r){let i=lZe.repeat(t);for(let a of e)switch(a.kind){case`print`:{let e=a.value??``;if(!e.trim()){n.push({nodeId:a.id,message:`输出内容为空`}),r.push(`${i}print("")`);break}r.push(a.mode===`text`?`${i}print(${fZe(e)})`:`${i}print(${e})`);break}case`set`:{let e=C9(a.name??``);e&&n.push({nodeId:a.id,message:`设置变量：${e}`});let t=(a.value??``).trim();t||n.push({nodeId:a.id,message:`设置变量：值不能为空`}),r.push(`${i}${(a.name??``).trim()||`变量`} = ${t||`0`}`);break}case`math`:{let e=C9(a.name??``);e&&n.push({nodeId:a.id,message:`计算：${e}`});let t=(a.left??``).trim(),o=(a.right??``).trim();t||n.push({nodeId:a.id,message:`计算：左值不能为空`}),o||n.push({nodeId:a.id,message:`计算：右值不能为空`}),r.push(`${i}${(a.name??``).trim()||`变量`} = ${gZe(t||`0`)} ${a.op} ${gZe(o||`1`)}`);break}case`repeat`:{let e=C9(a.varName??``);e&&n.push({nodeId:a.id,message:`重复：${e}`});let o=(a.times??``).trim();o||n.push({nodeId:a.id,message:`重复：次数不能为空`}),r.push(`${i}for ${(a.varName??``).trim()||`i`} in range(${o||`0`}):`),a.body.length===0?r.push(`${i}${lZe}pass`):_Ze(a.body,t+1,n,r);break}}}function vZe(e){let t=[],n=[];return n.push(`# 本文件由 Sparkle IDE 节点图自动生成`),n.push(``),e.nodes.length===0?(n.push(`# 画布是空的：请先添加一个节点`),{code:n.join(`
 `)+`
 `,issues:t,ok:!0}):(_Ze(e.nodes,0,t,n),{code:n.join(`
 `)+`
@@ -1061,8 +1061,287 @@ function sparkleMarkdown(e, pid, section) {
 		return `<div class="lg-code">${b.lang ? `<div class="lg-code-lang">${sparkleEsc(b.lang)}</div>` : ``}<pre class="lg-pre"><code>${sparkleEsc(b.code).replace(/\n+$/, ``)}</code></pre></div>`;
 	});
 }
+/* ================= Sparkle IDE 1.0.0：多语言 / 主题 / IDE 皮肤 / 键位 =================
+ * 约定：
+ * -  children 数组里的假分支一律用 mi(``, true)（注释节点），不能用 null ——
+ *    本 bundle 的 Vue 运行时遇 null 子节点会在 cloneIfMounted 处崩溃（已实测）。
+ * -  界面文案走 sparkleT(key)：中文返回 key 本身，英文查 SPARKLE_EN。
+ * -  应用外壳（活动栏/菜单/提示）走 DOM 覆盖翻译 sparkleApplyChromeI18n()。
+ */
+
+/* ---------------- 1. 多语言 ---------------- */
+var SPARKLE_LANG = { value: "zh" };
+var SPARKLE_EN = {
+	/* 设置面板 / 关于 */
+	"设置": "Settings", "编辑器": "Editor", "工作区": "Workspace", "编译": "Build", "关于": "About",
+	"语言": "Language", "外观": "Appearance", "主题": "Theme", "浅色": "Light", "深色": "Dark",
+	"IDE 风格": "IDE Style", "Sparkle 原生": "Sparkle Native",
+	"字号（8–48）": "Font size (8–48)", "字体": "Font family", "Tab 宽度（1–8）": "Tab size (1–8)",
+	"自动换行": "Word wrap", "关闭": "Off", "开启": "On", "按列折行": "Word wrap column", "有界折行": "Bounded",
+	"显示行号": "Show line numbers", "显示缩略图（minimap）": "Show minimap", "平滑滚动": "Smooth scrolling",
+	"光标闪烁": "Cursor blinking", "平滑": "Smooth", "闪烁": "Blink", "呼吸": "Phase", "展开": "Expand", "常亮": "Solid",
+	"显示空白字符": "Render whitespace", "不显示": "None", "边界": "Boundary", "选中时": "Selection", "行尾": "Trailing", "全部": "All",
+	"启动时恢复上次打开的工作区": "Restore last workspace on startup", "上次路径": "Last path",
+	"默认 C++ 标准": "Default C++ standard", "自动（按编译器版本，最高 C++26）": "Auto (by compiler, up to C++26)",
+	"选了编译器不支持的标准时会自动降到它支持的最高标准，不会编译失败。": "Unsupported standards fall back to the highest the compiler accepts, so the build never fails.",
+	"版本": "Version", "运行环境": "Runtime", "当前工作区": "Current workspace", "打开数据目录": "Open data folder",
+	"恢复默认设置": "Restore defaults", "所有修改都会立即保存并生效。": "All changes are saved and applied immediately.",
+	"（还没有记录）": "(not recorded yet)", "（未打开）": "(not open)", "完成": "Done", "关闭": "Close",
+	/* 洛谷面板 */
+	"全部难度": "All difficulties", "搜索": "Search", "搜索中…": "Searching…", "难度": "Difficulty",
+	"题号 / 题名 / 算法，如 线段树、P1001": "Problem ID / title / tag, e.g. segment tree, P1001",
+	"加载中…": "Loading…", "正在从洛谷拉取题面…": "Fetching problem from Luogu…",
+	"先在左边搜一道题，点标题就能看题面。": "Search a problem on the left, then click its title to read it.",
+	"在浏览器打开": "Open in browser", "复制": "Copy", "✓ 已复制": "✓ Copied",
+	"样例": "Samples", "样例 #": "Sample #", "输入": "Input", "输出": "Output",
+	"背景": "Background", "题面": "Description", "输入格式": "Input format", "输出格式": "Output format",
+	"说明 / 提示": "Notes / Hints", "题目背景": "Background", "题目描述": "Description",
+	"‹ 上一页": "‹ Prev", "下一页 ›": "Next ›",
+	/* 难度名（洛谷官方英文对照） */
+	"暂无评定": "Unrated", "入门": "Entry", "普及-": "Basic-", "普及/提高-": "Basic/Interm-",
+	"普及+/提高": "Basic+/Interm", "提高+/省选-": "Interm+/Prov-", "省选/NOI-": "Prov/NOI-", "NOI/NOI+/CTSC": "NOI/NOI+/CTSC",
+	/* 编译/运行动作（键位点击匹配用） */
+	"编译并运行": "Compile & Run", "运行": "Run", "编译当前文件": "Compile Current File",
+	/* 外壳常用 */
+	"资源管理器": "Explorer", "节点图": "Node Graph", "工具链": "Toolchain", "插件": "Plugins",
+	"洛谷题库": "Luogu Problems", "AI 助手": "AI Assistant", "OI-Helper（算法可视化）": "OI-Helper (Algorithm Visualizer)", "构建与运行": "Build & Run", "搜索": "Search", "构建与运行": "Build & Run",
+	"打开文件夹": "Open Folder", "新建文件": "New File", "新建文件夹": "New Folder",
+	"重命名": "Rename", "删除": "Delete", "保存": "Save", "编译": "Compile", "调试": "Debug",
+	"变量": "Variables", "输出": "Output", "运行中": "Running", "出错": "Error", "提示": "Hint",
+	"处理中…": "Processing…", "就绪": "Ready", "失败": "Failed", "取消": "Cancel", "刷新": "Refresh",
+	"重新扫描": "Rescan", "重新检测": "Re-detect", "自动发现": "Auto-detect", "下载中": "Downloading",
+	"尚未实现": "not implemented yet", "尚未接入": "not connected yet",
+};
+function sparkleT(key) {
+	if (SPARKLE_LANG.value !== "en") return key;
+	var v = SPARKLE_EN[key];
+	return v === void 0 ? key : v;
+}
+var SPARKLE_DIFFICULTY_NAMES_EN = { 0: "Unrated", 1: "Entry", 2: "Basic-", 3: "Basic/Interm-", 4: "Basic+/Interm", 5: "Interm+/Prov-", 6: "Prov/NOI-", 7: "NOI/NOI+/CTSC" };
+function sparkleDiffName(d) {
+	return SPARKLE_LANG.value === "en" ? (SPARKLE_DIFFICULTY_NAMES_EN[d] ?? String(d)) : (SPARKLE_DIFFICULTY_NAMES[d] ?? String(d));
+}
+
+/* ---------------- 2. 外壳 DOM 覆盖翻译 ---------------- */
+/* 动态串用正则；捕获组按位置拼英文模板 */
+var SPARKLE_EN_PATTERNS = [
+	[/^共 (\d+) 题 · 第 (\d+) \/ (\d+) 页 · 点标题看题面$/, (m) => `${m[1]} problems · page ${m[2]}/${m[3]} · click a title`],
+	[/^时限\s+(.+?)\s*ms$/, (m) => `Time ${m[1]} ms`],
+	[/^内存 (\d+) MB$/, (m) => `Memory ${m[1]} MB`],
+	[/^提交 (\d+) · 通过 (\d+)$/, (m) => `${m[1]} submissions · ${m[2]} accepted`],
+	[/^断点：第 (\d+) 行（点一下可以取消）$/, (m) => `Breakpoint: line ${m[1]} (click to remove)`],
+	[/^难度 (\d) · (.+)$/, (m) => `Difficulty ${m[1]} · ${SPARKLE_DIFFICULTY_NAMES_EN[Number(m[2])] ?? m[2]}`],
+	[/^程序异常结束，退出码 (\d+)。$/, (m) => `Process ended abnormally, exit code ${m[1]}.`],
+	[/^程序运行超时（(\d+) 秒），已经强制结束了。是不是有死循环？$/, (m) => `Run timed out (${m[1]}s) and was force-stopped. Infinite loop?`],
+	[/^共 (\d+) 个断点$/, (m) => `${m[1]} breakpoints`],
+	[/^来自插件 (.+)$/, (m) => `From plugin: ${m[1]}`],
+	[/^退出码 (\d+)$/, (m) => `Exit code ${m[1]}`],
+	[/^样例 #(\d+)$/, (m) => `Sample #${m[1]}`],
+	[/^「(.+)」有未保存的修改，确定要关闭吗？$/, (m) => `"${m[1]}" has unsaved changes. Close anyway?`],
+	[/^(.+) 个已安装$/, (m) => `${m[1]} installed`],
+	[/^(.+) 个文件，$/, (m) => `${m[1]} files,`],
+	[/^(.+) 个未保存$/, (m) => `${m[1]} unsaved`],
+];
+var SPARKLE_ZH_CACHE = new WeakMap();
+function sparkleChromeText(text) {
+	if (SPARKLE_LANG.value !== "en") return text;
+	var t = text.trim();
+	if (!t) return text;
+	if (SPARKLE_EN[t] !== void 0) return text.replace(t, SPARKLE_EN[t]);
+	for (var i = 0; i < SPARKLE_EN_PATTERNS.length; i++) {
+		var m = SPARKLE_EN_PATTERNS[i][0].exec(t);
+		if (m) return text.replace(t, SPARKLE_EN_PATTERNS[i][1](m));
+	}
+	return text;
+}
+var SPARKLE_ATTRS = ["title", "placeholder", "aria-label"];
+function sparkleChromeNode(node) {
+	if (node.nodeType === 3) {
+		var raw = node.nodeValue;
+		if (!raw || !/[一-龥]/.test(raw)) return;
+		var orig = SPARKLE_ZH_CACHE.get(node);
+		if (orig === void 0) { orig = raw; SPARKLE_ZH_CACHE.set(node, orig); }
+		var out = SPARKLE_LANG.value === "en" ? sparkleChromeText(orig) : orig;
+		if (out !== raw) node.nodeValue = out;
+		return;
+	}
+	if (node.nodeType !== 1) return;
+	var tag = node.tagName;
+	if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA") return;
+	/* 自己的面板用 t() 管了，跳过 */
+	if (node.classList && (node.classList.contains("lg-panel") || node.classList.contains("sset-mask"))) return;
+	if (node.closest && node.closest(".lg-panel, .sset-mask")) return;
+	for (var i = 0; i < SPARKLE_ATTRS.length; i++) {
+		var a = SPARKLE_ATTRS[i], v = node.getAttribute && node.getAttribute(a);
+		if (v && /[一-龥]/.test(v)) {
+			var origA = SPARKLE_ZH_CACHE.get(node);
+			if (origA === void 0 || origA[a] === void 0) {
+				if (origA === void 0) { origA = {}; SPARKLE_ZH_CACHE.set(node, origA); }
+				origA[a] = v;
+			}
+			var nv = SPARKLE_LANG.value === "en" ? sparkleChromeText(origA[a]) : origA[a];
+			if (node.getAttribute(a) !== nv) node.setAttribute(a, nv);
+		}
+	}
+}
+var SPARKLE_CHROME_OBSERVER = null;
+function sparkleChromeWalk(root) {
+	if (!root) return;
+	var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+		acceptNode: function (n) {
+			if (n.nodeType === 3) return /[一-龥]/.test(n.nodeValue || "") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+			return NodeFilter.FILTER_ACCEPT;
+		}
+	});
+	var seen = 0;
+	while (walker.nextNode() && seen < 20000) { sparkleChromeNode(walker.currentNode); seen++; }
+}
+function sparkleApplyChromeI18n() {
+	if (!document.body) return;
+	SPARKLE_ZH_CACHE = new WeakMap();
+	sparkleChromeWalk(document.body);
+	if (!SPARKLE_CHROME_OBSERVER && window.MutationObserver) {
+		SPARKLE_CHROME_OBSERVER = new MutationObserver(function (muts) {
+			for (var i = 0; i < muts.length; i++) {
+				var m = muts[i];
+				if (m.type === "attributes") sparkleChromeNode(m.target);
+				for (var j = 0; j < m.addedNodes.length; j++) sparkleChromeWalk(m.addedNodes[j]);
+				if (m.type === "characterData") sparkleChromeNode(m.target);
+			}
+		});
+		SPARKLE_CHROME_OBSERVER.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: SPARKLE_ATTRS });
+	}
+}
+
+/* ---------------- 3. 主题（深浅 + 三套 IDE 皮肤） ----------------
+ * data-sparkle-theme: native|codeblocks|devcpp|geany
+ * data-sparkle-mode:   light|dark
+ * 变量名与应用既有 :root 完全一致，未列出的变量保持原值。 */
+var SPARKLE_THEME_CSS = [
+/* 原生浅色 */
+`[data-sparkle-mode="light"]{color-scheme:light;--bg:#ffffff;--bg-elevated:#f3f3f3;--bg-panel:#f8f8f8;--border:#d4d4d4;--fg:#1f1f1f;--fg-dim:#5a5a5a;--fg-muted:#8a8a8a;--hover:#e8e8e8;--active:#d8d8d8;--status-bg:#f3f3f3}`,
+/* Code::Blocks：灰底蓝 accent，方正控件 */
+`[data-sparkle-theme="codeblocks"]{--bg:#f0f0f0;--bg-elevated:#e6e6e6;--bg-panel:#f7f7f7;--border:#c9c9c9;--fg:#1a1a1a;--fg-dim:#555555;--fg-muted:#888888;--accent:#0078d7;--accent-hover:#006abe;--hover:#dde6f0;--active:#c7d8ea;--status-bg:#e6e6e6;font-family:"Segoe UI",Tahoma,sans-serif}
+[data-sparkle-theme="codeblocks"] .activity-item{border-radius:2px}
+[data-sparkle-theme="codeblocks"] button{border-radius:2px}`,
+`[data-sparkle-theme="codeblocks"][data-sparkle-mode="dark"]{color-scheme:dark;--bg:#2b2b2b;--bg-elevated:#242424;--bg-panel:#303030;--border:#404040;--fg:#e0e0e0;--fg-dim:#a0a0a0;--fg-muted:#707070;--hover:#3a3a3a;--active:#484848;--status-bg:#242424}`,
+/* Dev-C++ 5/6：蓝灰主色，圆角按钮 */
+`[data-sparkle-theme="devcpp"]{--bg:#e8eef7;--bg-elevated:#dbe4f0;--bg-panel:#f4f7fb;--border:#b8c6d9;--fg:#12283f;--fg-dim:#3f5670;--fg-muted:#6b829b;--accent:#1e6bb8;--accent-hover:#175a9c;--hover:#cfdcec;--active:#b9cde4;--status-bg:#dbe4f0;font-family:"Segoe UI",Tahoma,"Microsoft YaHei",sans-serif}
+[data-sparkle-theme="devcpp"] button{border-radius:4px}
+[data-sparkle-theme="devcpp"] .activity-item{border-radius:4px}`,
+`[data-sparkle-theme="devcpp"][data-sparkle-mode="dark"]{color-scheme:dark;--bg:#1c2733;--bg-elevated:#16202b;--bg-panel:#22303e;--border:#33465c;--fg:#d7e3f0;--fg-dim:#8ea6bf;--fg-muted:#5f7391;--hover:#2a3a4c;--active:#37506a;--status-bg:#16202b}`,
+/* Geany：浅灰 + 钢青 accent，GTK 风 */
+`[data-sparkle-theme="geany"]{--bg:#f2f2f2;--bg-elevated:#e6e6e6;--bg-panel:#fafafa;--border:#c8c8c8;--fg:#1c1c1c;--fg-dim:#4a4a4a;--fg-muted:#7d7d7d;--accent:#4a7ba6;--accent-hover:#3d6790;--hover:#dcdcdc;--active:#c4c4c4;--status-bg:#e6e6e6;font-family:"Cantarell","Segoe UI",sans-serif}
+[data-sparkle-theme="geany"] button{border-radius:3px}`,
+`[data-sparkle-theme="geany"][data-sparkle-mode="dark"]{color-scheme:dark;--bg:#282828;--bg-elevated:#202020;--bg-panel:#2e2e2e;--border:#3c3c3c;--fg:#dcdcdc;--fg-dim:#9a9a9a;--fg-muted:#6f6f6f;--accent:#6b9dc2;--accent-hover:#548aad;--hover:#353535;--active:#424242;--status-bg:#202020}`,
+].join("\n");
+function sparkleInjectTheme() {
+	if (document.getElementById("sparkle-theme-css")) return;
+	var st = document.createElement("style");
+	st.id = "sparkle-theme-css";
+	st.textContent = SPARKLE_THEME_CSS;
+	(document.head || document.documentElement).appendChild(st);
+}
+/* 浅色编辑器主题（与 sparkle-dark 同构，base: vs） */
+var SPARKLE_LIGHT_THEME = { base: "vs", inherit: true, rules: [], colors: { "editor.background": "#ffffff", "editorGutter.background": "#f8f8f8", "editor.lineHighlightBackground": "#f0f0f0", "editorLineNumber.foreground": "#9aa0a6", "editorLineNumber.activeForeground": "#333333", "editorIndentGuide.background1": "#e5e5e5", "editorWidget.background": "#ffffff", "editorWidget.border": "#d4d4d4" } };
+function sparkleEditorDark() {
+	return (SparkleSettings.get().uiTheme || "dark") !== "light";
+}
+window.__sparkleEditorTheme = function (fallback) {
+	var m = window.__sparkleMonaco, ed = m && (m.editor || m);
+	if (ed && ed.defineTheme) { try { ed.defineTheme("sparkle-light", SPARKLE_LIGHT_THEME); } catch (e) { } }
+	return sparkleEditorDark() ? "sparkle-dark" : "sparkle-light";
+};
+window.__sparkleApplyEditorTheme = function () {
+	var m = window.__sparkleMonaco, ed = m && (m.editor || m);
+	if (ed && ed.setTheme) { try { ed.setTheme(window.__sparkleEditorTheme("sparkle-dark")); } catch (e) { } }
+};
+function sparkleApplyTheme() {
+	var s = SparkleSettings.get();
+	var root = document.documentElement;
+	if (!root) return;
+	root.dataset.sparkleTheme = s.ideTheme || "native";
+	root.dataset.sparkleMode = s.uiTheme || "dark";
+	root.lang = s.language === "en" ? "en" : "zh-CN";
+}
+
+/* ---------------- 4. IDE 快捷键位 ----------------
+ * 皮肤与键位绑定（官方默认键位）：
+ *  Code::Blocks  F9=编译并运行  Ctrl+F9=编译  Ctrl+F10=运行
+ *  Dev-C++ 5.x   F9=编译  F10=运行  F11=编译并运行
+ *  Geany         F8=编译  F5=运行  F9=编译并运行（Geany 的 Build）
+ * native 不接管任何按键，保持应用原有行为。 */
+var SPARKLE_KEYMAPS = {
+	codeblocks: [["F9", "compileAndRun"], ["ctrl+F9", "compile"], ["ctrl+F10", "run"]],
+	devcpp: [["F9", "compile"], ["F10", "run"], ["F11", "compileAndRun"]],
+	geany: [["F8", "compile"], ["F5", "run"], ["F9", "compileAndRun"]]
+};
+var SPARKLE_ACTION_LABELS = {
+	compile: ["编译当前文件", "Compile Current File"],
+	run: ["运行", "Run"],
+	compileAndRun: ["编译并运行", "Compile & Run"]
+};
+function sparkleFindActionButton(action) {
+	var labels = SPARKLE_ACTION_LABELS[action];
+	if (!labels) return null;
+	var btns = document.querySelectorAll("main button, .toolbar button, header button");
+	for (var i = 0; i < btns.length; i++) {
+		var t = (btns[i].textContent || "").trim();
+		if (labels.indexOf(t) >= 0 && !btns[i].disabled) return btns[i];
+	}
+	return null;
+}
+function sparkleKeymapNote() {
+	var profile = SparkleSettings.get().ideTheme;
+	var zh = {
+		codeblocks: "Code::Blocks 键位：F9 编译并运行 · Ctrl+F9 编译 · Ctrl+F10 运行",
+		devcpp: "Dev-C++ 键位：F9 编译 · F10 运行 · F11 编译并运行",
+		geany: "Geany 键位：F8 编译 · F5 运行 · F9 编译并运行",
+		native: "原生：不接管功能键（应用原有快捷键保持不变）"
+	};
+	var en = {
+		codeblocks: "Code::Blocks keys: F9 Compile & Run · Ctrl+F9 Compile · Ctrl+F10 Run",
+		devcpp: "Dev-C++ keys: F9 Compile · F10 Run · F11 Compile & Run",
+		geany: "Geany keys: F8 Compile · F5 Run · F9 Compile & Run",
+		native: "Native: function keys are not captured (existing shortcuts unchanged)"
+	};
+	var table = SPARKLE_LANG.value === "en" ? en : zh;
+	return table[profile] || table.native;
+}
+function sparkleKeymapHandler(e) {
+	if (e.altKey) return;
+	var binds = SPARKLE_KEYMAPS[SparkleSettings.get().ideTheme];
+	if (!binds) return;
+	var key = ((e.ctrlKey || e.metaKey) ? "ctrl+" : "") + String(e.key || "").toUpperCase();
+	for (var i = 0; i < binds.length; i++) {
+		if (binds[i][0] !== key) continue;
+		var btn = sparkleFindActionButton(binds[i][1]);
+		if (btn) {
+			e.preventDefault();
+			e.stopPropagation();
+			btn.click();
+		}
+		return;
+	}
+}
+if (typeof window !== "undefined" && window.addEventListener) {
+	window.addEventListener("keydown", sparkleKeymapHandler, true);
+}
+
+/* ---------------- 5. 总装 ---------------- */
+function sparkleApplyAll() {
+	sparkleInjectTheme();
+	sparkleApplyTheme();
+	var s = SparkleSettings.get();
+	SPARKLE_LANG.value = s.language === "en" ? "en" : "zh";
+	if (document.body) {
+		try { sparkleApplyChromeI18n(); } catch (e) { console.error("界面翻译失败：", e); }
+	}
+	window.__sparkleApplyEditorTheme && window.__sparkleApplyEditorTheme();
+}
+
 /* ---------------- 设置中心（主进程 settings.json 的渲染层镜像） ---------------- */
-var SPARKLE_SETTINGS_DEFAULTS = { fontSize: 14, fontFamily: `Consolas, "Courier New", monospace`, tabSize: 2, wordWrap: `off`, lineNumbers: true, minimap: true, cursorBlinking: `smooth`, smoothScrolling: true, renderWhitespace: `none`, restoreWorkspace: true, lastWorkspaceRoot: ``, cppStandard: `` };
+var SPARKLE_SETTINGS_DEFAULTS = { fontSize: 14, fontFamily: `Consolas, "Courier New", monospace`, tabSize: 2, wordWrap: `off`, lineNumbers: true, minimap: true, cursorBlinking: `smooth`, smoothScrolling: true, renderWhitespace: `none`, restoreWorkspace: true, lastWorkspaceRoot: ``, cppStandard: ``, language: `zh`, uiTheme: `dark`, ideTheme: `native` };
 function SparkleSettingsMerge(e) {
 	let t = {};
 	for (let n of Object.keys(SPARKLE_SETTINGS_DEFAULTS)) t[n] = e && e[n] !== void 0 ? e[n] : SPARKLE_SETTINGS_DEFAULTS[n];
@@ -1076,10 +1355,12 @@ var SparkleSettings = {
 	close() { SparkleSettingsOpen.value = false; },
 	async refresh() {
 		try { let e = await window.sparkle?.settings?.get?.(); if (e) SparkleSettingsState.value = SparkleSettingsMerge(e); } catch (e) { console.error(`读取设置失败：`, e); }
+		sparkleApplyAll();
 		return SparkleSettingsState.value;
 	},
 	async set(e) {
 		try { let t = await window.sparkle?.settings?.set?.(e); if (t) SparkleSettingsState.value = SparkleSettingsMerge(t); } catch (e) { console.error(`保存设置失败：`, e); throw e; }
+		sparkleApplyAll();
 		return SparkleSettingsState.value;
 	}
 };
@@ -1123,57 +1404,57 @@ var SparkleLuoguPanel = Gn({
 		nr(() => { search(1); });
 		return () => {
 			let p = problem.value, r = result.value, totalPages = r ? Math.max(1, Math.ceil(r.count / r.perPage)) : 1;
-			return E(), D(`div`, { class: `lg-panel` }, [
-				D(`div`, { class: `lg-toolbar` }, [
-					O(`input`, { class: `lg-input`, value: keyword.value, placeholder: `题号 / 题名 / 算法，如 线段树、P1001`, spellcheck: `false`, onInput: e => { keyword.value = e.target.value; }, onKeydown: e => { e.key === `Enter` && search(1); } }, null),
-					O(`select`, { class: `lg-select`, value: difficulty.value, title: `难度`, onChange: e => { difficulty.value = e.target.value, search(1); } }, [O(`option`, { value: `` }, `全部难度`), ...Object.keys(SPARKLE_DIFFICULTY_NAMES).map(k => O(`option`, { key: k, value: k }, `${k} · ${SPARKLE_DIFFICULTY_NAMES[k]}`))], null),
-					O(`button`, { type: `button`, class: `lg-btn`, disabled: loading.value, onClick: () => search(1) }, loading.value ? `搜索中…` : `搜索`, null)
+			return E(), O(`div`, { class: `lg-panel` }, [
+				O(`div`, { class: `lg-toolbar` }, [
+					O(`input`, { class: `lg-input`, value: keyword.value, placeholder: sparkleT(`题号 / 题名 / 算法，如 线段树、P1001`), spellcheck: `false`, onInput: e => { keyword.value = e.target.value; }, onKeydown: e => { e.key === `Enter` && search(1); } }, null),
+					O(`select`, { class: `lg-select`, value: difficulty.value, title: sparkleT(`难度`), onChange: e => { difficulty.value = e.target.value, search(1); } }, [O(`option`, { value: `` }, sparkleT(`全部难度`)), ...Object.keys(SPARKLE_DIFFICULTY_NAMES).map(k => O(`option`, { key: k, value: k }, `${k} · ${sparkleDiffName(Number(k))}`))], null),
+					O(`button`, { type: `button`, class: `lg-btn`, disabled: loading.value, onClick: () => search(1) }, loading.value ? sparkleT(`搜索中…`) : sparkleT(`搜索`), null)
 				], null),
-				error.value ? D(`div`, { class: `lg-status error` }, `⚠ ${error.value}`) : r ? D(`div`, { class: `lg-status` }, [pi(`共 `), O(`strong`, null, r.count), pi(` 题 · 第 ${page.value} / ${totalPages} 页 · 点标题看题面`)]) : null,
-				D(`div`, { class: `lg-body` }, [
-					D(`ul`, { class: `lg-list` }, [
-						loading.value ? D(`li`, { class: `lg-status` }, `加载中…`) : null,
-						...(r?.items ?? []).map(e => D(`li`, { key: e.pid }, [
+				error.value ? O(`div`, { class: `lg-status error` }, `⚠ ${error.value}`) : r ? O(`div`, { class: `lg-status` }, [pi(sparkleT(`共 `)), O(`strong`, null, String(r.count)), pi(` ${sparkleT(`题 · 第`)} ${page.value} / ${totalPages} ${sparkleT(`页 · 点标题看题面`)}`)]) : mi(``, true),
+				O(`div`, { class: `lg-body` }, [
+					O(`ul`, { class: `lg-list` }, [
+						loading.value ? O(`li`, { class: `lg-status` }, sparkleT(`加载中…`)) : mi(``, true),
+						...(r?.items ?? []).map(e => O(`li`, { key: e.pid }, [
 							O(`button`, { type: `button`, class: be([`lg-item`, { active: p?.pid === e.pid }]), onClick: () => openProblem(e.pid) }, [
 								O(`span`, { class: `lg-pid` }, e.pid),
 								O(`span`, { class: `lg-title`, title: e.title }, e.title),
-								e.difficulty !== null ? O(`span`, { class: `lg-diff d${e.difficulty}`, title: `难度 ${e.difficulty} · ${SPARKLE_DIFFICULTY_NAMES[e.difficulty] ?? ``}` }, SPARKLE_DIFFICULTY_NAMES[e.difficulty] ?? `?`) : null,
-								e.totalSubmit !== null ? O(`span`, { class: `lg-stat` }, `${e.totalAccepted ?? 0} / ${e.totalSubmit}`) : null
+								e.difficulty !== null ? O(`span`, { class: `lg-diff d${e.difficulty}`, title: `${sparkleT(`难度`)} ${e.difficulty} · ${sparkleDiffName(e.difficulty)}` }, sparkleDiffName(e.difficulty)) : mi(``, true),
+								e.totalSubmit !== null ? O(`span`, { class: `lg-stat` }, `${e.totalAccepted ?? 0} / ${e.totalSubmit}`) : mi(``, true)
 							], null)
 						]))
 					], null),
-					D(`div`, { class: `lg-detail` }, [
-						problemLoading.value ? D(`div`, { class: `lg-status` }, `正在从洛谷拉取题面…`) : null,
-						problemError.value ? D(`div`, { class: `lg-status error` }, `⚠ ${problemError.value}`) : null,
-						p ? D(`div`, { class: `lg-problem` }, [
-							D(`div`, { class: `lg-problem-head` }, [
-								D(`h2`, { class: `lg-problem-title` }, [O(`span`, { class: `lg-pid` }, p.pid), pi(` `), pi(p.title)]),
-								D(`div`, { class: `lg-problem-meta` }, [
-									p.difficulty !== null ? O(`span`, { class: `lg-diff d${p.difficulty}` }, SPARKLE_DIFFICULTY_NAMES[p.difficulty] ?? `?`) : null,
-									p.timeLimitMs ? O(`span`, { class: `lg-limit` }, `时限 ${p.timeLimitMs[0]}${p.timeLimitMs[1] !== p.timeLimitMs[0] ? `~${p.timeLimitMs[1]}` : ``} ms`) : null,
-									p.memoryLimitKb ? O(`span`, { class: `lg-limit` }, `内存 ${Math.round(p.memoryLimitKb / 1024)} MB`) : null,
-									p.totalSubmit !== null ? O(`span`, { class: `lg-limit` }, `提交 ${p.totalSubmit} · 通过 ${p.totalAccepted ?? 0}`) : null,
-									O(`button`, { type: `button`, class: `lg-btn ghost`, onClick: () => openExternal(p.pid) }, `在浏览器打开`)
+					O(`div`, { class: `lg-detail` }, [
+						problemLoading.value ? O(`div`, { class: `lg-status` }, sparkleT(`正在从洛谷拉取题面…`)) : mi(``, true),
+						problemError.value ? O(`div`, { class: `lg-status error` }, `⚠ ${problemError.value}`) : mi(``, true),
+						p ? O(`div`, { class: `lg-problem` }, [
+							O(`div`, { class: `lg-problem-head` }, [
+								O(`h2`, { class: `lg-problem-title` }, [O(`span`, { class: `lg-pid` }, p.pid), pi(` `), pi(p.title)]),
+								O(`div`, { class: `lg-problem-meta` }, [
+									p.difficulty !== null ? O(`span`, { class: `lg-diff d${p.difficulty}` }, sparkleDiffName(p.difficulty)) : mi(``, true),
+									p.timeLimitMs ? O(`span`, { class: `lg-limit` }, `${sparkleT(`时限`)} ${p.timeLimitMs[0]}${p.timeLimitMs[1] !== p.timeLimitMs[0] ? `~${p.timeLimitMs[1]}` : ``} ms`) : mi(``, true),
+									p.memoryLimitKb ? O(`span`, { class: `lg-limit` }, `${sparkleT(`内存`)} ${Math.round(p.memoryLimitKb / 1024)} MB`) : mi(``, true),
+									p.totalSubmit !== null ? O(`span`, { class: `lg-limit` }, `${sparkleT(`提交`)} ${p.totalSubmit} · ${sparkleT(`通过`)} ${p.totalAccepted ?? 0}`) : mi(``, true),
+									O(`button`, { type: `button`, class: `lg-btn ghost`, onClick: () => openExternal(p.pid) }, sparkleT(`在浏览器打开`))
 								], null)
 							], null),
-							p.background ? D(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.background, p.pid, `背景`) }, null)]) : null,
-							p.description ? D(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.description, p.pid, `题面`) }, null)]) : null,
-							p.formatI ? D(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.formatI, p.pid, `输入格式`) }, null)]) : null,
-							p.formatO ? D(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.formatO, p.pid, `输出格式`) }, null)]) : null,
-							p.samples.length ? D(`section`, { class: `lg-section` }, [D(`h3`, null, `样例`), ...p.samples.map((s, idx) => D(`div`, { class: `lg-sample`, key: idx }, [
-								D(`div`, { class: `lg-sample-head` }, [O(`span`, null, `样例 #${idx + 1}`), O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => copySample(`输入\n${s[0]}\n\n输出\n${s[1]}`, idx) }, copied.value === idx ? `✓ 已复制` : `复制`)]),
+							p.background ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.background, p.pid, `背景`) }, null)]) : mi(``, true),
+							p.description ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.description, p.pid, `题面`) }, null)]) : mi(``, true),
+							p.formatI ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.formatI, p.pid, `输入格式`) }, null)]) : mi(``, true),
+							p.formatO ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.formatO, p.pid, `输出格式`) }, null)]) : mi(``, true),
+							p.samples.length ? O(`section`, { class: `lg-section` }, [O(`h3`, null, sparkleT(`样例`)), ...p.samples.map((s, idx) => O(`div`, { class: `lg-sample`, key: idx }, [
+								O(`div`, { class: `lg-sample-head` }, [O(`span`, null, `${sparkleT(`样例 #`)}${idx + 1}`), O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => copySample(`输入\n${s[0]}\n\n输出\n${s[1]}`, idx) }, copied.value === idx ? sparkleT(`✓ 已复制`) : sparkleT(`复制`))]),
 								O(`pre`, { class: `lg-pre` }, `输入\n${s[0]}`),
 								O(`pre`, { class: `lg-pre` }, `输出\n${s[1]}`)
-							]))]) : null,
-							p.hint ? D(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.hint, p.pid, `提示`) }, null)]) : null
-						], null) : problemLoading.value || problemError.value ? null : D(`div`, { class: `lg-status lg-empty` }, `先在左边搜一道题，点标题就能看题面。`)
+							]))]) : mi(``, true),
+							p.hint ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.hint, p.pid, `提示`) }, null)]) : mi(``, true)
+						], null) : problemLoading.value || problemError.value ? mi(``, true) : O(`div`, { class: `lg-status lg-empty` }, sparkleT(`先在左边搜一道题，点标题就能看题面。`))
 					], null)
 				], null),
-				r && totalPages > 1 ? D(`div`, { class: `lg-pager` }, [
-					O(`button`, { type: `button`, class: `lg-page-btn`, disabled: loading.value || page.value <= 1, onClick: () => search(page.value - 1) }, `‹ 上一页`),
+				r && totalPages > 1 ? O(`div`, { class: `lg-pager` }, [
+					O(`button`, { type: `button`, class: `lg-page-btn`, disabled: loading.value || page.value <= 1, onClick: () => search(page.value - 1) }, sparkleT(`‹ 上一页`)),
 					O(`span`, { class: `lg-page-info` }, `${page.value} / ${totalPages}`),
-					O(`button`, { type: `button`, class: `lg-page-btn`, disabled: loading.value || page.value >= totalPages, onClick: () => search(page.value + 1) }, `下一页 ›`)
-				], null) : null
+					O(`button`, { type: `button`, class: `lg-page-btn`, disabled: loading.value || page.value >= totalPages, onClick: () => search(page.value + 1) }, sparkleT(`下一页 ›`))
+				], null) : mi(``, true)
 			], null);
 		}
 	}
@@ -1185,50 +1466,57 @@ var SparkleSettingsPanel = Gn({
 		let info = an(null);
 		async function loadInfo() { try { info.value = await window.sparkle?.ide?.appInfo?.(); } catch (e) { console.error(`读取应用信息失败：`, e); } }
 		nr(loadInfo);
-		const field = (label, control) => D(`label`, { class: `sset-field` }, [D(`span`, { class: `sset-label` }, label), control]);
+		const field = (label, control) => O(`label`, { class: `sset-field` }, [O(`span`, { class: `sset-label` }, label), control]);
 		const numField = (key, min, max) => O(`input`, { type: `number`, class: `sset-input`, min: String(min), max: String(max), value: String(SparkleSettings.get()[key]), onChange: e => { let t = parseInt(e.target.value, 10); if (Number.isFinite(t) && t >= min && t <= max) SparkleSettings.set({ [key]: t }); } }, null);
 		const selField = (key, options) => O(`select`, { class: `sset-input`, value: String(SparkleSettings.get()[key]), onChange: e => SparkleSettings.set({ [key]: e.target.value }) }, options.map(o => O(`option`, { key: o[0], value: o[0] }, o[1])), null);
-		const boolField = (key, label) => D(`label`, { class: `sset-check` }, [O(`input`, { type: `checkbox`, checked: SparkleSettings.get()[key], onChange: e => SparkleSettings.set({ [key]: e.target.checked }) }, null), pi(` ${label}`)]);
+		const boolField = (key, label) => O(`label`, { class: `sset-check` }, [O(`input`, { type: `checkbox`, checked: SparkleSettings.get()[key], onChange: e => SparkleSettings.set({ [key]: e.target.checked }) }, null), pi(` ${label}`)]);
 		return () => {
 			if (!SparkleSettingsOpen.value) return mi(``, true);
-			return D(`div`, { class: `sset-mask`, onClick: e => { if (e.target === e.currentTarget) SparkleSettings.close(); } }, [
-				D(`div`, { class: `sset-modal`, role: `dialog`, "aria-modal": `true`, "aria-label": `设置` }, [
-					D(`div`, { class: `sset-head` }, [O(`h2`, null, `设置`), O(`button`, { type: `button`, class: `sset-icon-btn`, title: `关闭`, onClick: () => SparkleSettings.close() }, `✕`)]),
-					D(`div`, { class: `sset-body` }, [
-						D(`section`, { class: `sset-section` }, [
-							O(`h3`, null, `编辑器`),
-							field(`字号（8–48）`, numField(`fontSize`, 8, 48)),
-							field(`字体`, selField(`fontFamily`, [[`Consolas, "Courier New", monospace`, `Consolas（默认）`], [`"Courier New", monospace`, `Courier New`], [`"Microsoft YaHei", sans-serif`, `微软雅黑`], [`monospace`, `系统默认等宽`]])),
-							field(`Tab 宽度（1–8）`, numField(`tabSize`, 1, 8)),
-							field(`自动换行`, selField(`wordWrap`, [[`off`, `关闭`], [`on`, `开启`], [`wordWrapColumn`, `按列折行`], [`bounded`, `有界折行`]])),
-							boolField(`lineNumbers`, `显示行号`),
-							boolField(`minimap`, `显示缩略图（minimap）`),
-							boolField(`smoothScrolling`, `平滑滚动`),
-							field(`光标闪烁`, selField(`cursorBlinking`, [[`smooth`, `平滑`], [`blink`, `闪烁`], [`phase`, `呼吸`], [`expand`, `展开`], [`solid`, `常亮`]])),
-							field(`显示空白字符`, selField(`renderWhitespace`, [[`none`, `不显示`], [`boundary`, `边界`], [`selection`, `选中时`], [`trailing`, `行尾`], [`all`, `全部`]]))
+			return O(`div`, { class: `sset-mask`, onClick: e => { if (e.target === e.currentTarget) SparkleSettings.close(); } }, [
+				O(`div`, { class: `sset-modal`, role: `dialog`, "aria-modal": `true`, "aria-label": sparkleT(`设置`) }, [
+					O(`div`, { class: `sset-head` }, [O(`h2`, null, sparkleT(`设置`)), O(`button`, { type: `button`, class: `sset-icon-btn`, title: sparkleT(`关闭`), onClick: () => SparkleSettings.close() }, `✕`)]),
+					O(`div`, { class: `sset-body` }, [
+						O(`section`, { class: `sset-section` }, [
+							O(`h3`, null, sparkleT(`外观`)),
+							field(sparkleT(`语言`), selField(`language`, [[`zh`, `中文`], [`en`, `English`]])),
+							field(sparkleT(`主题`), selField(`uiTheme`, [[`light`, sparkleT(`浅色`)], [`dark`, sparkleT(`深色`)]])),
+							field(sparkleT(`IDE 风格`), selField(`ideTheme`, [[`native`, sparkleT(`Sparkle 原生`)], [`codeblocks`, `Code::Blocks`], [`devcpp`, `Dev-C++`], [`geany`, `Geany`]])),
+							O(`p`, { class: `sset-note` }, sparkleKeymapNote())
 						], null),
-						D(`section`, { class: `sset-section` }, [
-							O(`h3`, null, `工作区`),
-							boolField(`restoreWorkspace`, `启动时恢复上次打开的工作区`),
-							D(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, `上次路径`), O(`code`, { class: `sset-path` }, SparkleSettings.get().lastWorkspaceRoot || `（还没有记录）`)])
+						O(`section`, { class: `sset-section` }, [
+							O(`h3`, null, sparkleT(`编辑器`)),
+							field(sparkleT(`字号（8–48）`), numField(`fontSize`, 8, 48)),
+							field(sparkleT(`字体`), selField(`fontFamily`, [[`Consolas, "Courier New", monospace`, `Consolas（默认）`], [`"Courier New", monospace`, `Courier New`], [`"Microsoft YaHei", sans-serif`, `微软雅黑`], [`monospace`, `系统默认等宽`]])),
+							field(sparkleT(`Tab 宽度（1–8）`), numField(`tabSize`, 1, 8)),
+							field(sparkleT(`自动换行`), selField(`wordWrap`, [[`off`, sparkleT(`关闭`)], [`on`, sparkleT(`开启`)], [`wordWrapColumn`, sparkleT(`按列折行`)], [`bounded`, sparkleT(`有界折行`)]])),
+							boolField(`lineNumbers`, sparkleT(`显示行号`)),
+							boolField(`minimap`, sparkleT(`显示缩略图（minimap）`)),
+							boolField(`smoothScrolling`, sparkleT(`平滑滚动`)),
+							field(sparkleT(`光标闪烁`), selField(`cursorBlinking`, [[`smooth`, sparkleT(`平滑`)], [`blink`, sparkleT(`闪烁`)], [`phase`, sparkleT(`呼吸`)], [`expand`, sparkleT(`展开`)], [`solid`, sparkleT(`常亮`)]])),
+							field(sparkleT(`显示空白字符`), selField(`renderWhitespace`, [[`none`, sparkleT(`不显示`)], [`boundary`, sparkleT(`边界`)], [`selection`, sparkleT(`选中时`)], [`trailing`, sparkleT(`行尾`)], [`all`, sparkleT(`全部`)]]))
 						], null),
-						D(`section`, { class: `sset-section` }, [
-							O(`h3`, null, `编译`),
-							field(`默认 C++ 标准`, selField(`cppStandard`, [[``, `自动（按编译器版本，最高 C++26）`], [`c++11`, `C++11`], [`c++14`, `C++14`], [`c++17`, `C++17`], [`c++20`, `C++20`], [`c++23`, `C++23`], [`c++26`, `C++26（需要 GCC 15+）`]])),
-							D(`p`, { class: `sset-note` }, `选了编译器不支持的标准时会自动降到它支持的最高标准，不会编译失败。`)
+						O(`section`, { class: `sset-section` }, [
+							O(`h3`, null, sparkleT(`工作区`)),
+							boolField(`restoreWorkspace`, sparkleT(`启动时恢复上次打开的工作区`)),
+							O(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, sparkleT(`上次路径`)), O(`code`, { class: `sset-path` }, SparkleSettings.get().lastWorkspaceRoot || sparkleT(`（还没有记录）`))])
 						], null),
-						D(`section`, { class: `sset-section` }, [
-							O(`h3`, null, `关于`),
-							D(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, `版本`), O(`code`, { class: `sset-path` }, `Sparkle IDE ${info.value?.version ?? `…`}`)]),
-							D(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, `运行环境`), O(`code`, { class: `sset-path` }, `Electron ${info.value?.electron ?? `?`} · Chromium ${info.value?.chrome ?? `?`} · Node ${info.value?.node ?? `?`}`)]),
-							D(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, `当前工作区`), O(`code`, { class: `sset-path` }, info.value?.workspace?.root || `（未打开）`)]),
-							D(`div`, { class: `sset-row` }, [
-								O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => { let d = info.value?.userData; if (d) window.sparkle?.ide?.openPath?.(d); } }, `打开数据目录`),
-								O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => SparkleSettings.set(SPARKLE_SETTINGS_DEFAULTS) }, `恢复默认设置`)
+						O(`section`, { class: `sset-section` }, [
+							O(`h3`, null, sparkleT(`编译`)),
+							field(sparkleT(`默认 C++ 标准`), selField(`cppStandard`, [[``, sparkleT(`自动（按编译器版本，最高 C++26）`)], [`c++11`, `C++11`], [`c++14`, `C++14`], [`c++17`, `C++17`], [`c++20`, `C++20`], [`c++23`, `C++23`], [`c++26`, `C++26（需要 GCC 15+）`]])),
+							O(`p`, { class: `sset-note` }, sparkleT(`选了编译器不支持的标准时会自动降到它支持的最高标准，不会编译失败。`))
+						], null),
+						O(`section`, { class: `sset-section` }, [
+							O(`h3`, null, sparkleT(`关于`)),
+							O(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, sparkleT(`版本`)), O(`code`, { class: `sset-path` }, `Sparkle IDE ${info.value?.version ?? `…`}`)]),
+							O(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, sparkleT(`运行环境`)), O(`code`, { class: `sset-path` }, `Electron ${info.value?.electron ?? `?`} · Chromium ${info.value?.chrome ?? `?`} · Node ${info.value?.node ?? `?`}`)]),
+							O(`div`, { class: `sset-row` }, [O(`span`, { class: `sset-label` }, sparkleT(`当前工作区`)), O(`code`, { class: `sset-path` }, info.value?.workspace?.root || sparkleT(`（未打开）`))]),
+							O(`div`, { class: `sset-row` }, [
+								O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => { let d = info.value?.userData; if (d) window.sparkle?.ide?.openPath?.(d); } }, sparkleT(`打开数据目录`)),
+								O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => SparkleSettings.set(SPARKLE_SETTINGS_DEFAULTS) }, sparkleT(`恢复默认设置`))
 							], null)
 						], null)
 					], null),
-					D(`div`, { class: `sset-foot` }, [D(`p`, { class: `sset-note` }, `所有修改都会立即保存并生效。`), O(`button`, { type: `button`, class: `lg-btn`, onClick: () => SparkleSettings.close() }, `完成`)])
+					O(`div`, { class: `sset-foot` }, [O(`p`, { class: `sset-note` }, sparkleT(`所有修改都会立即保存并生效。`)), O(`button`, { type: `button`, class: `lg-btn`, onClick: () => SparkleSettings.close() }, sparkleT(`完成`))])
 				], null)
 			], null);
 		}

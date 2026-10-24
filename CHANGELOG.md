@@ -1,7 +1,51 @@
 # 更新日志
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，
-版本号采用语义化版本。本文件自 `1.0.1-alpha` 起记录。
+版本号采用语义化版本。
+
+## [1.0.0] - 2026-10-24
+
+首个正式版。在 1.0.1-alpha 基础上补齐多语言、主题体系与三套 IDE 风格，
+并修复了 alpha 版中「洛谷题库空壳」等一批功能性缺陷。
+
+### 修复（重要）
+
+- **洛谷题库面板空壳**：面板打开后只有工具栏、题目列表永远为空。根因是
+  渲染树中 `cond ? 节点 : null` 的假分支产生了 `null` 子节点，本应用的 Vue
+  运行时在 `cloneIfMounted` 处直接抛错并吞掉整棵子树。全部假分支改为
+  注释节点（`createCommentVNode`，与 Vue 编译器一致）。
+- **面板更新不刷新**：手写渲染树误用了 `createElementBlock`（块优化），
+  无 patchFlag 时 `dynamicChildren` 为空，导致重渲染整体空转——搜索出结果
+  但界面不更新。改用 `createElementVNode` 走全量 diff。
+- **数字子节点渲染为空**：`<strong>{count}</strong>` 传数字时被标记成
+  数组子节点，元素渲染为空并在后续 patch 抛 `Invalid array length`。
+  统一转字符串。
+- **界面翻译观察器死循环**：属性值未变化时仍调用 `setAttribute`，在部分
+  实现下会触发 mutation → 观察器 → 再写入的微任务风暴。改为仅在值真正
+  变化时写入。
+
+### 新增
+
+- **多语言（中文 / English）**：设置面板「外观 → 语言」。自带面板全部走
+  字典；应用外壳（活动栏、工具栏、空状态、提示）由 DOM 覆盖翻译，支持
+  动态文案的正则翻译，切换即时生效无需重启。
+- **主题色（浅色 / 深色）**：设置面板「外观 → 主题」。同时切换应用外壳
+  配色与编辑器主题（浅色为新增的 `sparkle-light`，深色沿用 `sparkle-dark`）。
+- **三套 IDE 风格**（外观 → IDE 风格），皮肤与快捷键位一一对应：
+  | 风格 | 编译并运行 | 编译 | 运行 |
+  |---|---|---|---|
+  | Code::Blocks | `F9` | `Ctrl+F9` | `Ctrl+F10` |
+  | Dev-C++ | `F11` | `F9` | `F10` |
+  | Geany | `F9` | `F8` | `F5` |
+  各皮肤还带有对应软件的配色（Code::Blocks 灰底蓝、Dev-C++ 蓝灰、Geany
+  浅灰钢青）、字体与控件圆角，深浅色模式各有独立配色。
+- 设置新增 `language` / `uiTheme` / `ideTheme` 三个键，主进程白名单校验，
+  存于 `%APPDATA%\Sparkle IDE\settings.json`。
+
+### 变更
+
+- `resources/app/package.json` 版本号 1.0.1-alpha → **1.0.0**
+- 设置面板新增「外观」分区（语言 / 主题 / IDE 风格 + 当前键位说明）
 
 ## [1.0.1-alpha] - 2026-10-18
 

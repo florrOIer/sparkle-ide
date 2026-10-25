@@ -176,7 +176,8 @@ electron.contextBridge.exposeInMainWorld("sparkle", {
 		onDebugEvent: (handler) => subscribe(IDE_CHANNELS.debugEvent, handler),
 		appInfo: () => electron.ipcRenderer.invoke(IDE_CHANNELS.appInfo),
 		openPath: (path) => electron.ipcRenderer.invoke(IDE_CHANNELS.openPath, path),
-		setWorkspace: (directory) => electron.ipcRenderer.invoke(IDE_CHANNELS.setWorkspace, directory)
+		setWorkspace: (directory) => electron.ipcRenderer.invoke(IDE_CHANNELS.setWorkspace, directory),
+		runSample: (request) => electron.ipcRenderer.invoke("ide:runSample", request)
 	},
 	plugin: {
 		list: () => electron.ipcRenderer.invoke(PLUGIN_CHANNELS.list),

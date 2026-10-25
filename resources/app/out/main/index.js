@@ -4754,7 +4754,74 @@ electron.app.whenReady().then(async () => {
 		return runProject(requireRoot(), compiler, request, executable, pythonExecutable);
 	});
 	electron.ipcMain.handle(SEARCH_CHANNELS.query, (_event, options) => searchWorkspace(requireRoot(), options));
+
+/**
+ * 洛谷写题「测样例」：编译当前文件 → 用样例输入喂 stdin 跑一遍 → 与期望输出比对。
+ * 判定：CE 编译失败 / TLE 超时 / RE 运行错误 / WA 答案错误 / AC 通过 / RUN 仅运行
+ */
+async function runSample(root, compiler, request) {
+	const startedAt = Date.now();
+	const compiled = await compileSingleFile(root, compiler, { path: request.path });
+	if (!compiled.ok) return {
+		verdict: "CE",
+		message: compiled.friendlyError || "编译失败",
+		stdout: "",
+		stderr: compiled.output || "",
+		expected: String(request.expected ?? ""),
+		input: String(request.input ?? ""),
+		durationMs: Date.now() - startedAt
+	};
+	const executable = compiled.executable;
+	const directory = (0, node_path.dirname)(executable);
+	const env = { ...process.env };
+	delete env.ELECTRON_RUN_AS_NODE;
+	if (compiler && compiler.binDir) prependPath(env, compiler.binDir);
+	const limit = Math.max(1000, Number(request.timeLimitMs) || 5000);
+	const run = await new Promise((resolve) => {
+		let stdout = "", stderr = "", timedOut = false, settled = false;
+		const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+		let child;
+		try {
+			child = (0, node_child_process.spawn)(executable, [], { cwd: directory, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+		} catch (error) {
+			finish({ code: -1, stdout: "", stderr: String(error?.message ?? error), timedOut: false });
+			return;
+		}
+		const timer = setTimeout(() => { timedOut = true; try { child.kill(); } catch (e) { } }, limit);
+		child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+		child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+		child.on("error", (error) => { clearTimeout(timer); finish({ code: -1, stdout, stderr: stderr + String(error?.message ?? error), timedOut }); });
+		child.on("close", (code) => { clearTimeout(timer); finish({ code: code ?? -1, stdout, stderr, timedOut }); });
+		try {
+			child.stdin.write(String(request.input ?? ""));
+			child.stdin.end();
+		} catch (e) { }
+	});
+	const normalize = (text) => String(text ?? "").replace(/\r\n?/g, "\n").split("\n").map((line) => line.replace(/[ \t]+$/g, "")).join("\n").trim();
+	const expected = normalize(request.expected);
+	const actual = normalize(run.stdout);
+	let verdict;
+	if (run.timedOut) verdict = "TLE";
+	else if (run.code !== 0) verdict = "RE";
+	else if (!expected) verdict = "RUN";
+	else if (actual === expected) verdict = "AC";
+	else verdict = "WA";
+	return {
+		verdict,
+		stdout: run.stdout,
+		stderr: run.stderr,
+		expected: String(request.expected ?? ""),
+		input: String(request.input ?? ""),
+		exitCode: run.code,
+		timedOut: run.timedOut,
+		durationMs: Date.now() - startedAt
+	};
+}
 	electron.ipcMain.handle(IDE_CHANNELS.compileFile, (_event, request) => compileSingleFile(requireRoot(), currentCompiler(), request));
+	electron.ipcMain.handle("ide:runSample", async (_event, request) => {
+		try { return await runSample(requireRoot(), currentCompiler(), request ?? {}); }
+		catch (error) { return { verdict: "ERR", message: String(error?.message ?? error) }; }
+	});
 	electron.ipcMain.handle(IDE_CHANNELS.runFile, (_event, request) => runExecutable(requireRoot(), currentCompiler(), detect().find((tool) => tool.id === "python")?.path ?? "python", request));
 	electron.ipcMain.handle(IDE_CHANNELS.runInConsole, (_event, request) => runInConsole(requireRoot(), currentCompiler(), request.executable, request.language, detect().find((tool) => tool.id === "python")?.path ?? "python"));
 	electron.ipcMain.handle("luogu:search", (_event, options) => luoguSearchProblems(options ?? {}));

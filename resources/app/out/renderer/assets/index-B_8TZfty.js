@@ -1092,7 +1092,7 @@ var SPARKLE_EN = {
 	"题号 / 题名 / 算法，如 线段树、P1001": "Problem ID / title / tag, e.g. segment tree, P1001",
 	"加载中…": "Loading…", "正在从洛谷拉取题面…": "Fetching problem from Luogu…",
 	"先在左边搜一道题，点标题就能看题面。": "Search a problem on the left, then click its title to read it.",
-	"在浏览器打开": "Open in browser", "复制": "Copy", "✓ 已复制": "✓ Copied",
+	"在浏览器打开": "Open in browser", "复制": "Copy", "✓ 已复制": "✓ Copied", "测样例": "Test sample", "测试中…": "Testing…", "期望输出：": "Expected:", "实际输出：": "Actual:", "超出时限，可能有死循环。": "Time limit exceeded — maybe an infinite loop.", "样例全部通过。": "All samples passed.", "已保存": "Saved", "保存失败：": "Save failed: ", "‹ 返回列表": "‹ Back to list", "写题": "Write solution", "未保存": "Unsaved", "编译中…": "Compiling…", "编译成功": "Compiled successfully",
 	"样例": "Samples", "样例 #": "Sample #", "输入": "Input", "输出": "Output",
 	"背景": "Background", "题面": "Description", "输入格式": "Input format", "输出格式": "Output format",
 	"说明 / 提示": "Notes / Hints", "题目背景": "Background", "题目描述": "Description",
@@ -1347,6 +1347,10 @@ var SPARKLE_PANEL_CSS = [
 ".lg-compile-out.ok{color:#2ea043}",
 ".lg-compile-out.bad{color:#d9534f}",
 ".lg-code-msg{padding:4px 10px;border-top:1px solid var(--border);font-size:11px;color:var(--fg-muted);flex:none}",
+".lg-verdict{font-size:11px;padding:1px 6px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border)}",
+".lg-verdict.v-ac{color:#2ea043;border-color:#2ea043}",
+".lg-verdict.v-wa,.lg-verdict.v-re,.lg-verdict.v-ce,.lg-verdict.v-tle,.lg-verdict.v-err{color:#d9534f;border-color:#d9534f}",
+".lg-verdict.v-run{color:var(--fg-dim)}",
 ].join(String.fromCharCode(10));
 function sparkleInjectPanelCss() {
 	if (document.getElementById("sparkle-panel-css")) return;
@@ -1399,7 +1403,7 @@ var SparkleLuoguPanel = Gn({
 	setup() {
 		let keyword = an(``), difficulty = an(``), page = an(1), result = an(null), loading = an(false), error = an(``), problem = an(null), problemLoading = an(false), problemError = an(``), copied = an(-1);
 		/* 写题区状态 */
-		let codePath = an(``), codeText = an(``), codeDirty = an(false), codeMsg = an(``), codeBusy = an(false), compileOut = an(``), compileOk = an(null), hasWorkspace = an(true);
+		let codePath = an(``), codeText = an(``), codeDirty = an(false), codeMsg = an(``), codeBusy = an(false), compileOut = an(``), compileOk = an(null), hasWorkspace = an(true), verdicts = an({}), testing = an(-1);
 		let editorHost = null, monacoEd = null, suppressChange = false, monacoReady = an(true);
 
 		async function search(next) {
@@ -1418,7 +1422,7 @@ var SparkleLuoguPanel = Gn({
 			return `// ${pid} ${title}\n#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n\t\n\treturn 0;\n}\n`;
 		}
 		async function loadSolution(pid, title) {
-			codeMsg.value = ``, compileOut.value = ``, compileOk.value = null;
+			codeMsg.value = ``, compileOut.value = ``, compileOk.value = null, verdicts.value = {};
 			const rel = `luogu/${pid}.cpp`;
 			try {
 				let text = await window.sparkle?.fs?.readFile?.(rel);
@@ -1468,12 +1472,62 @@ var SparkleLuoguPanel = Gn({
 			} catch (e) { compileOk.value = false, compileOut.value = String(e?.message ?? e); }
 			finally { codeBusy.value = false; }
 		}
+
+/* ---------- 测样例 ---------- */
+var SPARKLE_VERDICT_ZH = { AC: `✓ 通过`, WA: `✗ 答案错误`, TLE: `⏱ 超时`, RE: `✗ 运行错误`, CE: `✗ 编译失败`, RUN: `已运行`, ERR: `✗ 出错` };
+var SPARKLE_VERDICT_EN = { AC: `✓ Accepted`, WA: `✗ Wrong Answer`, TLE: `⏱ Time Limit`, RE: `✗ Runtime Error`, CE: `✗ Compile Error`, RUN: `Ran`, ERR: `✗ Error` };
+function sparkleVerdictLabel(v) {
+	return (SPARKLE_LANG.value === `en` ? SPARKLE_VERDICT_EN : SPARKLE_VERDICT_ZH)[v] || String(v || ``);
+}
+function sparkleVerdictText(r) {
+	var v = (r && r.verdict) || `ERR`;
+	var lines = [sparkleVerdictLabel(v) + (r && r.durationMs ? ` · ${r.durationMs} ms` : ``)];
+	if (r && r.message) lines.push(String(r.message));
+	if (v === `WA`) {
+		lines.push(sparkleT(`期望输出：`) + `\n` + String(r.expected ?? ``).replace(/\s+$/, ``));
+		lines.push(sparkleT(`实际输出：`) + `\n` + String(r.stdout ?? ``).replace(/\s+$/, ``));
+	}
+	if (v === `RE` && r && r.stderr) lines.push(`stderr:\n` + String(r.stderr).replace(/\s+$/, ``));
+	if (v === `TLE`) lines.push(sparkleT(`超出时限，可能有死循环。`));
+	if (v === `AC`) lines.push(sparkleT(`样例全部通过。`));
+	return lines.join(`\n`);
+}
+
 		async function runCode() {
 			if (!codePath.value) return;
 			if (monacoEd) codeText.value = monacoEd.getValue();
 			if (codeDirty.value) await saveCode(true);
 			try { await window.sparkle?.ide?.runFile?.({ path: codePath.value }); }
 			catch (e) { codeMsg.value = String(e?.message ?? e); }
+		}
+
+		async function testSample(idx) {
+			const p = problem.value;
+			if (!p || !codePath.value || testing.value >= 0) return;
+			const sample = (p.samples || [])[idx];
+			if (!sample) return;
+			if (monacoEd) codeText.value = monacoEd.getValue();
+			if (codeDirty.value) await saveCode(true);
+			testing.value = idx;
+			try {
+				const r = await window.sparkle?.ide?.runSample?.({
+					path: codePath.value,
+					input: sample[0],
+					expected: sample[1],
+					timeLimitMs: (p.timeLimitMs && p.timeLimitMs[1]) || 5000
+				});
+				const next = Object.assign({}, verdicts.value);
+				next[idx] = r || { verdict: `ERR` };
+				verdicts.value = next;
+				compileOk.value = r?.verdict === `AC`;
+				compileOut.value = sparkleVerdictText(r);
+			} catch (e) {
+				const next = Object.assign({}, verdicts.value);
+				next[idx] = { verdict: `ERR`, message: String(e?.message ?? e) };
+				verdicts.value = next;
+				compileOk.value = false;
+				compileOut.value = String(e?.message ?? e);
+			} finally { testing.value = -1; }
 		}
 
 		/* ---------- 编辑器挂载（Monaco 优先，缺省降级 textarea） ---------- */
@@ -1570,7 +1624,7 @@ var SparkleLuoguPanel = Gn({
 						p.formatI ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.formatI, p.pid, `输入格式`) }, null)]) : mi(``, true),
 						p.formatO ? O(`section`, { class: `lg-section` }, [O(`div`, { class: `lg-prose`, innerHTML: sparkleMarkdown(p.formatO, p.pid, `输出格式`) }, null)]) : mi(``, true),
 						p.samples.length ? O(`section`, { class: `lg-section` }, [O(`h3`, null, sparkleT(`样例`)), ...p.samples.map((s, idx) => O(`div`, { class: `lg-sample`, key: idx }, [
-							O(`div`, { class: `lg-sample-head` }, [O(`span`, null, `${sparkleT(`样例 #`)}${idx + 1}`), O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => copySample(`输入\n${s[0]}\n\n输出\n${s[1]}`, idx) }, copied.value === idx ? sparkleT(`✓ 已复制`) : sparkleT(`复制`))]),
+							O(`div`, { class: `lg-sample-head` }, [O(`span`, null, `${sparkleT(`样例 #`)}${idx + 1}`), verdicts.value[idx] ? O(`span`, { class: be([`lg-verdict`, `v-${String(verdicts.value[idx].verdict || ``).toLowerCase()}`]) }, sparkleVerdictLabel(verdicts.value[idx].verdict)) : mi(``, true), O(`button`, { type: `button`, class: `lg-btn ghost small`, disabled: !codePath.value || testing.value >= 0, onClick: () => testSample(idx) }, testing.value === idx ? sparkleT(`测试中…`) : sparkleT(`测样例`)), O(`button`, { type: `button`, class: `lg-btn ghost small`, onClick: () => copySample(`输入\n${s[0]}\n\n输出\n${s[1]}`, idx) }, copied.value === idx ? sparkleT(`✓ 已复制`) : sparkleT(`复制`))]),
 							O(`pre`, { class: `lg-pre` }, `输入\n${s[0]}`),
 							O(`pre`, { class: `lg-pre` }, `输出\n${s[1]}`)
 						]))]) : mi(``, true),

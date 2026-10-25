@@ -4756,67 +4756,146 @@ electron.app.whenReady().then(async () => {
 	electron.ipcMain.handle(SEARCH_CHANNELS.query, (_event, options) => searchWorkspace(requireRoot(), options));
 
 /**
- * 洛谷写题「测样例」：编译当前文件 → 用样例输入喂 stdin 跑一遍 → 与期望输出比对。
- * 判定：CE 编译失败 / TLE 超时 / RE 运行错误 / WA 答案错误 / AC 通过 / RUN 仅运行
+ * 洛谷写题「测样例」：编译 → 喂样例输入 → 判定。
+ * 判定：AC 通过 / WA 答案错误 / TLE 超时（题目时限，默认 1 秒）/ MLE 内存超限（128 MB）
+ *      / OLE 输出超限（4 MB）/ RE 运行错误 / CE 编译失败 / UKE 未知错误 / RUN 仅运行
+ *
+ * 两个工程细节：
+ * 1. 进程启动本身有开销（杀软扫描等），直接拿墙钟和时限比会误判 TLE。
+ *    首次调用时测一次空进程启动耗时作为 allowance，阈值 = 时限 + allowance。
+ * 2. 子进程峰值内存没有零成本接口，运行中途采样两次工作集（300ms / 800ms），取最大值。
+ *    另外 bad_alloc / STATUS_NO_MEMORY 等明确内存信号也直接判 MLE。
  */
+const SAMPLE_TIME_LIMIT_MS = 1000;
+const SAMPLE_MEMORY_LIMIT_KB = 128 * 1024;
+const SAMPLE_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
+const SAMPLE_MEMORY_SAMPLES = [300, 800];
+let sparkleStartupAllowanceMs = 0;
+
+async function sparkleMeasureStartup() {
+	if (sparkleStartupAllowanceMs > 0) return sparkleStartupAllowanceMs;
+	const startedAt = Date.now();
+	await new Promise((resolve) => {
+		try {
+			const probe = (0, node_child_process).spawn(process.execPath, [`-e`, ``], { windowsHide: true, stdio: `ignore` });
+			probe.on(`close`, resolve);
+			probe.on(`error`, resolve);
+		} catch (e) { resolve(); }
+	});
+	sparkleStartupAllowanceMs = Math.min(Math.max(Date.now() - startedAt, 0), 4000);
+	return sparkleStartupAllowanceMs;
+}
+
+function sampleWorkingSet(pid) {
+	return new Promise((resolve) => {
+		(0, node_child_process).execFile(`tasklist`, [`/FI`, `PID eq ${pid}`, `/FO`, `CSV`, `/NH`], { windowsHide: true, timeout: 20000 }, (error, out) => {
+			if (error || !out) return resolve(0);
+			const line = String(out).trim().split(/\r?\n/)[0] || ``;
+			const cols = line.split(`","`);
+			const raw = cols.length >= 5 ? cols[cols.length - 1] : ``;
+			const kb = parseInt(String(raw).replace(/[^\d]/g, ``), 10);
+			resolve(Number.isFinite(kb) ? kb : 0);
+		});
+	});
+}
+
+function runSampleProcess(executable, directory, input, hardLimitMs, compiler) {
+	return new Promise((resolve) => {
+		const env = { ...process.env };
+		delete env.ELECTRON_RUN_AS_NODE;
+		if (compiler && compiler.binDir) prependPath(env, compiler.binDir);
+		let stdout = ``, stderr = ``, timedOut = false, ole = false, settled = false, peakKb = 0, spawnError = false;
+		const startedAt = Date.now();
+		const finish = (extra) => {
+			if (settled) return;
+			settled = true;
+			resolve({ code: -1, stdout, stderr, timedOut, ole, peakKb, spawnError, elapsedMs: Date.now() - startedAt, ...extra });
+		};
+		let child;
+		try {
+			child = (0, node_child_process).spawn(executable, [], { cwd: directory, env, windowsHide: true, stdio: [`pipe`, `pipe`, `pipe`] });
+		} catch (error) {
+			return finish({ stderr: String(error?.message ?? error), spawnError: true });
+		}
+		const kill = () => { try { child.kill(); } catch (e) { } };
+		const timer = setTimeout(() => { timedOut = true; kill(); }, hardLimitMs);
+		const probeTimers = SAMPLE_MEMORY_SAMPLES.map((at) => setTimeout(async () => {
+			if (settled || !child.pid) return;
+			const kb = await sampleWorkingSet(child.pid);
+			if (kb > peakKb) peakKb = kb;
+		}, at));
+		child.stdout.on(`data`, (chunk) => {
+			if (ole) return;
+			stdout += chunk.toString(`utf8`);
+			if (Buffer.byteLength(stdout, `utf8`) > SAMPLE_OUTPUT_LIMIT_BYTES) {
+				ole = true;
+				kill();
+			}
+		});
+		child.stderr.on(`data`, (chunk) => { if (stderr.length < 65536) stderr += chunk.toString(`utf8`); });
+		const cleanup = () => { clearTimeout(timer); probeTimers.forEach((t) => clearTimeout(t)); };
+		child.on(`close`, (code) => { cleanup(); finish({ code: code ?? -1 }); });
+		child.on(`error`, (error) => { cleanup(); finish({ stderr: stderr + String(error?.message ?? error), spawnError: true }); });
+		try {
+			child.stdin.write(String(input ?? ``));
+			child.stdin.end();
+		} catch (e) { }
+	});
+}
+
 async function runSample(root, compiler, request) {
 	const startedAt = Date.now();
+	const base = {
+		stdout: ``,
+		stderr: ``,
+		expected: String(request.expected ?? ``),
+		input: String(request.input ?? ``),
+		durationMs: 0,
+		memoryKb: 0
+	};
 	const compiled = await compileSingleFile(root, compiler, { path: request.path });
 	if (!compiled.ok) return {
-		verdict: "CE",
-		message: compiled.friendlyError || "编译失败",
-		stdout: "",
-		stderr: compiled.output || "",
-		expected: String(request.expected ?? ""),
-		input: String(request.input ?? ""),
+		...base,
+		verdict: `CE`,
+		message: compiled.friendlyError || `编译失败`,
+		stderr: compiled.output || ``,
 		durationMs: Date.now() - startedAt
 	};
 	const executable = compiled.executable;
 	const directory = (0, node_path.dirname)(executable);
-	const env = { ...process.env };
-	delete env.ELECTRON_RUN_AS_NODE;
-	if (compiler && compiler.binDir) prependPath(env, compiler.binDir);
-	const limit = Math.max(1000, Number(request.timeLimitMs) || 5000);
-	const run = await new Promise((resolve) => {
-		let stdout = "", stderr = "", timedOut = false, settled = false;
-		const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
-		let child;
-		try {
-			child = (0, node_child_process.spawn)(executable, [], { cwd: directory, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-		} catch (error) {
-			finish({ code: -1, stdout: "", stderr: String(error?.message ?? error), timedOut: false });
-			return;
-		}
-		const timer = setTimeout(() => { timedOut = true; try { child.kill(); } catch (e) { } }, limit);
-		child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
-		child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
-		child.on("error", (error) => { clearTimeout(timer); finish({ code: -1, stdout, stderr: stderr + String(error?.message ?? error), timedOut }); });
-		child.on("close", (code) => { clearTimeout(timer); finish({ code: code ?? -1, stdout, stderr, timedOut }); });
-		try {
-			child.stdin.write(String(request.input ?? ""));
-			child.stdin.end();
-		} catch (e) { }
-	});
-	const normalize = (text) => String(text ?? "").replace(/\r\n?/g, "\n").split("\n").map((line) => line.replace(/[ \t]+$/g, "")).join("\n").trim();
+	const limit = Math.max(100, Number(request.timeLimitMs) || SAMPLE_TIME_LIMIT_MS);
+	const allowance = await sparkleMeasureStartup();
+	const hardLimit = limit + allowance;
+	const run = await runSampleProcess(executable, directory, request.input, hardLimit, compiler);
+	const normalize = (text) => String(text ?? ``).replace(/\r\n?/g, `\n`).split(`\n`).map((line) => line.replace(/[ \t]+$/g, ``)).join(`\n`).trim();
 	const expected = normalize(request.expected);
 	const actual = normalize(run.stdout);
+	const oomSignal = /bad_alloc|out of memory|cannot allocate|memory exhausted/i.test(run.stderr || ``);
+	const oomExit = run.code === 3221225495 || run.code === -1073741801; /* 0xC0000017 STATUS_NO_MEMORY */
 	let verdict;
-	if (run.timedOut) verdict = "TLE";
-	else if (run.code !== 0) verdict = "RE";
-	else if (!expected) verdict = "RUN";
-	else if (actual === expected) verdict = "AC";
-	else verdict = "WA";
+	if (run.spawnError) verdict = `UKE`;
+	else if (oomSignal || oomExit || run.peakKb > SAMPLE_MEMORY_LIMIT_KB) verdict = `MLE`;
+	else if (run.timedOut) verdict = `TLE`;
+	else if (run.ole) verdict = `OLE`;
+	else if (run.code !== 0) verdict = `RE`;
+	else if (!expected) verdict = `RUN`;
+	else if (actual === expected) verdict = `AC`;
+	else verdict = `WA`;
 	return {
+		...base,
 		verdict,
 		stdout: run.stdout,
 		stderr: run.stderr,
-		expected: String(request.expected ?? ""),
-		input: String(request.input ?? ""),
 		exitCode: run.code,
 		timedOut: run.timedOut,
-		durationMs: Date.now() - startedAt
+		memoryKb: run.peakKb || 0,
+		runMs: Math.max(0, run.elapsedMs - allowance),
+		durationMs: Date.now() - startedAt,
+		limits: { timeMs: limit, memoryKb: SAMPLE_MEMORY_LIMIT_KB, outputBytes: SAMPLE_OUTPUT_LIMIT_BYTES }
 	};
 }
+
+
 	electron.ipcMain.handle(IDE_CHANNELS.compileFile, (_event, request) => compileSingleFile(requireRoot(), currentCompiler(), request));
 	electron.ipcMain.handle("ide:runSample", async (_event, request) => {
 		try { return await runSample(requireRoot(), currentCompiler(), request ?? {}); }

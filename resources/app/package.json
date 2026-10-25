@@ -1,7 +1,7 @@
 {
   "name": "sparkle-ide",
   "productName": "Sparkle IDE",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Sparkle IDE — 面向初学者的便携式 C++ IDE：类 VS Code 外壳 + 节点图 + 洛谷题库 + 预装编译器",
   "main": "out/main/index.js",

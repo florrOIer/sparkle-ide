@@ -1092,7 +1092,7 @@ var SPARKLE_EN = {
 	"题号 / 题名 / 算法，如 线段树、P1001": "Problem ID / title / tag, e.g. segment tree, P1001",
 	"加载中…": "Loading…", "正在从洛谷拉取题面…": "Fetching problem from Luogu…",
 	"先在左边搜一道题，点标题就能看题面。": "Search a problem on the left, then click its title to read it.",
-	"在浏览器打开": "Open in browser", "复制": "Copy", "✓ 已复制": "✓ Copied", "测样例": "Test sample", "测试中…": "Testing…", "期望输出：": "Expected:", "实际输出：": "Actual:", "超出时限，可能有死循环。": "Time limit exceeded — maybe an infinite loop.", "样例全部通过。": "All samples passed.", "已保存": "Saved", "保存失败：": "Save failed: ", "‹ 返回列表": "‹ Back to list", "写题": "Write solution", "未保存": "Unsaved", "编译中…": "Compiling…", "编译成功": "Compiled successfully",
+	"在浏览器打开": "Open in browser", "复制": "Copy", "✓ 已复制": "✓ Copied", "测样例": "Test sample", "测试中…": "Testing…", "期望输出：": "Expected:", "实际输出：": "Actual:", "超出时限，可能有死循环。": "Time limit exceeded — maybe an infinite loop.", "运行超过时限，可能有死循环。": "Run exceeded the time limit — maybe an infinite loop.", "峰值内存超过 128 MB。": "Peak memory exceeded 128 MB.", "输出超过 4 MB。": "Output exceeded 4 MB.", "样例通过。": "Sample passed.", "样例全部通过。": "All samples passed.", "已保存": "Saved", "保存失败：": "Save failed: ", "‹ 返回列表": "‹ Back to list", "写题": "Write solution", "未保存": "Unsaved", "编译中…": "Compiling…", "编译成功": "Compiled successfully",
 	"样例": "Samples", "样例 #": "Sample #", "输入": "Input", "输出": "Output",
 	"背景": "Background", "题面": "Description", "输入格式": "Input format", "输出格式": "Output format",
 	"说明 / 提示": "Notes / Hints", "题目背景": "Background", "题目描述": "Description",
@@ -1349,7 +1349,7 @@ var SPARKLE_PANEL_CSS = [
 ".lg-code-msg{padding:4px 10px;border-top:1px solid var(--border);font-size:11px;color:var(--fg-muted);flex:none}",
 ".lg-verdict{font-size:11px;padding:1px 6px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border)}",
 ".lg-verdict.v-ac{color:#2ea043;border-color:#2ea043}",
-".lg-verdict.v-wa,.lg-verdict.v-re,.lg-verdict.v-ce,.lg-verdict.v-tle,.lg-verdict.v-err{color:#d9534f;border-color:#d9534f}",
+".lg-verdict.v-wa,.lg-verdict.v-re,.lg-verdict.v-ce,.lg-verdict.v-tle,.lg-verdict.v-mle,.lg-verdict.v-ole,.lg-verdict.v-uke,.lg-verdict.v-err{color:#d9534f;border-color:#d9534f}",
 ".lg-verdict.v-run{color:var(--fg-dim)}",
 ].join(String.fromCharCode(10));
 function sparkleInjectPanelCss() {
@@ -1474,22 +1474,28 @@ var SparkleLuoguPanel = Gn({
 		}
 
 /* ---------- 测样例 ---------- */
-var SPARKLE_VERDICT_ZH = { AC: `✓ 通过`, WA: `✗ 答案错误`, TLE: `⏱ 超时`, RE: `✗ 运行错误`, CE: `✗ 编译失败`, RUN: `已运行`, ERR: `✗ 出错` };
-var SPARKLE_VERDICT_EN = { AC: `✓ Accepted`, WA: `✗ Wrong Answer`, TLE: `⏱ Time Limit`, RE: `✗ Runtime Error`, CE: `✗ Compile Error`, RUN: `Ran`, ERR: `✗ Error` };
+var SPARKLE_VERDICT_ZH = { AC: `✓ 通过`, WA: `✗ 答案错误`, TLE: `⏱ 超时`, MLE: `▣ 内存超限`, OLE: `⇢ 输出超限`, RE: `✗ 运行错误`, CE: `✗ 编译失败`, UKE: `? 未知错误`, RUN: `已运行`, ERR: `? 未知错误` };
+var SPARKLE_VERDICT_EN = { AC: `✓ Accepted`, WA: `✗ Wrong Answer`, TLE: `⏱ Time Limit`, MLE: `▣ Memory Limit`, OLE: `⇢ Output Limit`, RE: `✗ Runtime Error`, CE: `✗ Compile Error`, UKE: `? Unknown Error`, RUN: `Ran`, ERR: `? Unknown Error` };
 function sparkleVerdictLabel(v) {
 	return (SPARKLE_LANG.value === `en` ? SPARKLE_VERDICT_EN : SPARKLE_VERDICT_ZH)[v] || String(v || ``);
 }
 function sparkleVerdictText(r) {
 	var v = (r && r.verdict) || `ERR`;
-	var lines = [sparkleVerdictLabel(v) + (r && r.durationMs ? ` · ${r.durationMs} ms` : ``)];
+	var facts = [];
+	if (r && r.runMs >= 0) facts.push(`${r.runMs} ms`);
+	if (r && r.memoryKb > 0) facts.push(`${(r.memoryKb / 1024).toFixed(1)} MB`);
+	if (r && r.limits && r.limits.timeMs) facts.push(`${sparkleT(`时限`)} ${r.limits.timeMs} ms`);
+	var lines = [sparkleVerdictLabel(v) + (facts.length ? ` · ` + facts.join(` · `) : ``)];
 	if (r && r.message) lines.push(String(r.message));
 	if (v === `WA`) {
 		lines.push(sparkleT(`期望输出：`) + `\n` + String(r.expected ?? ``).replace(/\s+$/, ``));
 		lines.push(sparkleT(`实际输出：`) + `\n` + String(r.stdout ?? ``).replace(/\s+$/, ``));
 	}
 	if (v === `RE` && r && r.stderr) lines.push(`stderr:\n` + String(r.stderr).replace(/\s+$/, ``));
-	if (v === `TLE`) lines.push(sparkleT(`超出时限，可能有死循环。`));
-	if (v === `AC`) lines.push(sparkleT(`样例全部通过。`));
+	if (v === `TLE`) lines.push(sparkleT(`运行超过时限，可能有死循环。`));
+	if (v === `MLE`) lines.push(sparkleT(`峰值内存超过 128 MB。`));
+	if (v === `OLE`) lines.push(sparkleT(`输出超过 4 MB。`));
+	if (v === `AC`) lines.push(sparkleT(`样例通过。`));
 	return lines.join(`\n`);
 }
 

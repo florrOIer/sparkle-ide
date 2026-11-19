@@ -1,0 +1,10 @@
+{
+  "id": "sparkle.sort-visual",
+  "name": "排序可视化",
+  "version": "1.0.0",
+  "description": "逐步展示冒泡排序的每一次交换。这是插件开发教程第 7 节的示例。",
+  "main": "index.js",
+  "activation": ["onSolverPanel"],
+  "permissions": [],
+  "contributes": { "commands": [] }
+}

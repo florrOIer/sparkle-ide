@@ -1,0 +1,10 @@
+{
+  "id": "sparkle.cpp-snippets",
+  "name": "C++ 竞赛片段",
+  "version": "1.0.0",
+  "description": "常用的竞赛代码模板，零权限。这是插件开发教程第 6 节的示例。",
+  "main": "index.js",
+  "activation": ["onLanguage:cpp"],
+  "permissions": [],
+  "contributes": { "commands": [] }
+}

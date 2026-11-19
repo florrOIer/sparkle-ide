@@ -46,10 +46,7 @@ var IDE_CHANNELS = {
 	debugStart: "ide:debugStart",
 	debugCommand: "ide:debugCommand",
 	debugStop: "ide:debugStop",
-	debugEvent: "ide:debugEvent",
-	appInfo: "ide:appInfo",
-	openPath: "ide:openPath",
-	setWorkspace: "ide:setWorkspace"
+	debugEvent: "ide:debugEvent"
 };
 //#endregion
 //#region src/shared/bench.ts
@@ -70,6 +67,14 @@ var PLUGIN_CHANNELS = {
 	cancel: "plugin:cancel",
 	listSolvers: "plugin:listSolvers",
 	runSolver: "plugin:runSolver",
+	getActiveDocument: "plugin:getActiveDocument",
+	applyEdits: "plugin:applyEdits",
+	formatDocument: "plugin:formatDocument",
+	listFormatters: "plugin:listFormatters",
+	listCommands: "plugin:listCommands",
+	executeCommand: "plugin:executeCommand",
+	editorRequest: "plugin:editorRequest",
+	editorReply: "plugin:editorReply",
 	sandboxActivate: "plugin-sandbox:activate",
 	sandboxRpc: "plugin-sandbox:rpc",
 	sandboxCancel: "plugin-sandbox:cancel",
@@ -80,6 +85,10 @@ var PLUGIN_CHANNELS = {
 	sandboxFatal: "plugin-sandbox:fatal",
 	sandboxLog: "plugin-sandbox:log",
 	changed: "plugin:changed"
+};
+var SETTINGS_CHANNELS = {
+	get: "settings:get",
+	set: "settings:set"
 };
 //#endregion
 //#region src/shared/toolchain.ts
@@ -96,19 +105,6 @@ var TOOLCHAIN_CHANNELS = {
 	browse: "toolchain:browse",
 	/** 记住用户选了哪个候选 */
 	selectCandidate: "toolchain:selectCandidate"
-};
-//#endregion
-//#region src/shared/luogu.ts
-var LUOGU_CHANNELS = {
-	search: "luogu:search",
-	problem: "luogu:problem",
-	openExternal: "luogu:openExternal"
-};
-//#endregion
-//#region src/shared/settings.ts
-var SETTINGS_CHANNELS = {
-	get: "settings:get",
-	set: "settings:set"
 };
 //#endregion
 //#region src/preload/index.ts
@@ -153,6 +149,10 @@ electron.contextBridge.exposeInMainWorld("sparkle", {
 		readDirectory: (path) => electron.ipcRenderer.invoke(FS_CHANNELS.readDirectory, path),
 		readFile: (path) => electron.ipcRenderer.invoke(FS_CHANNELS.readFile, path),
 		saveFile: (path, content) => electron.ipcRenderer.invoke(FS_CHANNELS.saveFile, path, content),
+		/** 另存为：弹系统保存框，返回 { ok, path, name, workspace } */
+		saveFileAs: (defaultName, content) => electron.ipcRenderer.invoke("fs:saveFileAs", defaultName, content),
+		/** 读图片成 data URL（题面里的相对路径图片靠它显示） */
+		readImage: (path) => electron.ipcRenderer.invoke("fs:readImage", path),
 		createFile: (parent, name) => electron.ipcRenderer.invoke(FS_CHANNELS.createFile, parent, name),
 		createDirectory: (parent, name) => electron.ipcRenderer.invoke(FS_CHANNELS.createDirectory, parent, name),
 		renameEntry: (path, newName) => electron.ipcRenderer.invoke(FS_CHANNELS.renameEntry, path, newName),
@@ -162,22 +162,21 @@ electron.contextBridge.exposeInMainWorld("sparkle", {
 		scan: () => electron.ipcRenderer.invoke(BUILD_CHANNELS.scan),
 		ensureCMakeLists: (project) => electron.ipcRenderer.invoke(BUILD_CHANNELS.ensureCMakeLists, project),
 		compile: (request) => electron.ipcRenderer.invoke(BUILD_CHANNELS.compile, request),
-		run: (request, executable) => electron.ipcRenderer.invoke(BUILD_CHANNELS.run, request, executable)
+		run: (request, executable) => electron.ipcRenderer.invoke(BUILD_CHANNELS.run, request, executable),
+		/** 单文件编译 / 运行的额外参数（C++ 标准、第三方库的 -I/-L/-l） */
+		getConfig: () => electron.ipcRenderer.invoke("build:getConfig"),
+		setConfig: (config) => electron.ipcRenderer.invoke("build:setConfig", config)
 	},
 	search: { query: (options) => electron.ipcRenderer.invoke(SEARCH_CHANNELS.query, options) },
 	ide: {
 		compileFile: (request) => electron.ipcRenderer.invoke(IDE_CHANNELS.compileFile, request),
 		runFile: (request) => electron.ipcRenderer.invoke(IDE_CHANNELS.runFile, request),
 		runInConsole: (request) => electron.ipcRenderer.invoke(IDE_CHANNELS.runInConsole, request),
-		openFileDialog: () => electron.ipcRenderer.invoke(IDE_CHANNELS.openFileDialog),
+		openFileDialog: (kind) => electron.ipcRenderer.invoke(IDE_CHANNELS.openFileDialog, kind),
 		debugStart: (request) => electron.ipcRenderer.invoke(IDE_CHANNELS.debugStart, request),
 		debugCommand: (action) => electron.ipcRenderer.invoke(IDE_CHANNELS.debugCommand, action),
 		debugStop: () => electron.ipcRenderer.invoke(IDE_CHANNELS.debugStop),
-		onDebugEvent: (handler) => subscribe(IDE_CHANNELS.debugEvent, handler),
-		appInfo: () => electron.ipcRenderer.invoke(IDE_CHANNELS.appInfo),
-		openPath: (path) => electron.ipcRenderer.invoke(IDE_CHANNELS.openPath, path),
-		setWorkspace: (directory) => electron.ipcRenderer.invoke(IDE_CHANNELS.setWorkspace, directory),
-		runSample: (request) => electron.ipcRenderer.invoke("ide:runSample", request)
+		onDebugEvent: (handler) => subscribe(IDE_CHANNELS.debugEvent, handler)
 	},
 	plugin: {
 		list: () => electron.ipcRenderer.invoke(PLUGIN_CHANNELS.list),
@@ -194,7 +193,71 @@ electron.contextBridge.exposeInMainWorld("sparkle", {
 			pluginId,
 			solverId,
 			inputs
-		})
+		}),
+		/**
+		* 主进程转发过来的编辑器请求（插件要读文档 / 改代码时）。
+		* 渲染层执行后用 replyEditorRequest 回话。
+		*/
+		onEditorRequest: (handler) => subscribe(PLUGIN_CHANNELS.editorRequest, handler),
+		/** 把编辑器请求的结果回给主进程 */
+		replyEditorRequest: (reply) => {
+			electron.ipcRenderer.send(PLUGIN_CHANNELS.editorReply, reply);
+		},
+		/** 当前哪些语言有插件注册了格式化器：语言 id → 插件 id */
+		listFormatters: () => electron.ipcRenderer.invoke(PLUGIN_CHANNELS.listFormatters),
+		/** 用插件格式化一段文本；没有格式化器时返回 null（渲染层回退到 Monaco 内置） */
+		formatDocument: (languageId, content) => electron.ipcRenderer.invoke(PLUGIN_CHANNELS.formatDocument, {
+			languageId,
+			content
+		}),
+		/** 命令面板：已注册的插件命令 */
+		listCommands: () => electron.ipcRenderer.invoke(PLUGIN_CHANNELS.listCommands),
+		/** 执行插件命令，返回给用户看的提示（可为空字符串） */
+		executeCommand: (commandId) => electron.ipcRenderer.invoke(PLUGIN_CHANNELS.executeCommand, commandId)
+	},
+	/** Git 面板（独立插件）：状态 / 提交 / 分支 / 拉取推送 */
+	git: {
+		exec: (payload) => electron.ipcRenderer.invoke("git:exec", payload)
+	},
+	/** OI 工作台：本地测试 / 对拍 / 导题 */
+	oi: {
+		run: (request) => electron.ipcRenderer.invoke("oi:run", request),
+		oj: (payload) => electron.ipcRenderer.invoke("oi:oj", payload),
+		git: (payload) => electron.ipcRenderer.invoke("oi:git", payload),
+		/** 提交代码：洛谷 / AtCoder 直接交，Codeforces 开窗口让你点 */
+		submit: (payload) => electron.ipcRenderer.invoke("oi:submit", payload),
+		/** 轮询评测结果 */
+		submission: (payload) => electron.ipcRenderer.invoke("oi:submission", payload),
+		/** 比赛列表、比赛题目、整场导入 */
+		contests: (payload) => electron.ipcRenderer.invoke("oi:contests", payload),
+		contestProblems: (payload) => electron.ipcRenderer.invoke("oi:contestProblems", payload),
+		importContest: (payload) => electron.ipcRenderer.invoke("oi:importContest", payload),
+		/** 比赛报名 */
+		join: (payload) => electron.ipcRenderer.invoke("oi:join", payload),
+		/** 提交 / 导入过程中的进度推送（Codeforces 填表、评测结果） */
+		onProgress: (handler) => subscribe("oi:progress", handler)
+	},
+	/** AI 助手：配置 + 流式对话（请求放在主进程发，绕开 CORS） */
+	ai: {
+		loadConfig: () => electron.ipcRenderer.invoke("ai:loadConfig"),
+		saveConfig: (config) => electron.ipcRenderer.invoke("ai:saveConfig", config),
+		chat: (request) => electron.ipcRenderer.invoke("ai:chat", request),
+		abort: (id) => electron.ipcRenderer.invoke("ai:abort", id),
+		onChunk: (handler) => subscribe("ai:chunk", handler)
+	},
+	/** 外观：壁纸 + 面板/编辑器透明度 */
+	appearance: {
+		load: () => electron.ipcRenderer.invoke("appearance:load"),
+		pick: () => electron.ipcRenderer.invoke("appearance:pick"),
+		save: (patch) => electron.ipcRenderer.invoke("appearance:save", patch),
+		clear: () => electron.ipcRenderer.invoke("appearance:clear")
+	},
+	/** 应用设置：主题 / 字号 / 停用哪些插件 */
+	settings: {
+		get: () => electron.ipcRenderer.invoke(SETTINGS_CHANNELS.get),
+		set: (settings) => electron.ipcRenderer.invoke(SETTINGS_CHANNELS.set, settings),
+		/** 插件通过 config 能力改了设置时，主进程会推一份新的过来 */
+		onChanged: (handler) => subscribe("settings:changed", handler)
 	},
 	toolchain: {
 		detect: (force) => electron.ipcRenderer.invoke(TOOLCHAIN_CHANNELS.detect, force),
@@ -207,15 +270,6 @@ electron.contextBridge.exposeInMainWorld("sparkle", {
 		selectCandidate: (executable) => electron.ipcRenderer.invoke(TOOLCHAIN_CHANNELS.selectCandidate, executable),
 		reset: () => electron.ipcRenderer.invoke("toolchain:reset"),
 		onProgress: (handler) => subscribe(TOOLCHAIN_CHANNELS.progress, handler)
-	},
-	luogu: {
-		search: (options) => electron.ipcRenderer.invoke(LUOGU_CHANNELS.search, options),
-		problem: (pid) => electron.ipcRenderer.invoke(LUOGU_CHANNELS.problem, pid),
-		openExternal: (url) => electron.ipcRenderer.invoke(LUOGU_CHANNELS.openExternal, url)
-	},
-	settings: {
-		get: () => electron.ipcRenderer.invoke(SETTINGS_CHANNELS.get),
-		set: (update) => electron.ipcRenderer.invoke(SETTINGS_CHANNELS.set, update)
 	}
 });
 //#endregion

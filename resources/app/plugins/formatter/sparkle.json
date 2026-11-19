@@ -1,0 +1,10 @@
+{
+  "id": "sparkle.formatter",
+  "name": "自动格式化",
+  "version": "1.0.0",
+  "description": "C / C++ / Python 的自动格式化：缩进对齐、行尾空格、括号间距。结果可用 Ctrl+Z 撤回。零权限。",
+  "main": "index.js",
+  "activation": ["onLanguage:cpp", "onLanguage:python"],
+  "permissions": [],
+  "contributes": { "commands": [] }
+}

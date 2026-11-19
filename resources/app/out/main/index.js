@@ -9,6 +9,7 @@ let node_string_decoder = require("node:string_decoder");
 let node_http = require("node:http");
 let node_https = require("node:https");
 let node_stream_promises = require("node:stream/promises");
+let node_stream = require("node:stream");
 //#region src/main/pathGuard.ts
 /**
 * 路径越界校验。
@@ -82,11 +83,14 @@ try {
 /**
 * 插件 origin 的 CSP。
 *
-* connect-src 'none' 是关键：插件的 fetch / XHR / WebSocket / EventSource
-* 会被浏览器直接拒绝。**即使授予了 network 权限，插件也无法自行联网**，
-* 只能通过主进程代理 —— 于是主进程能审计、能限流、能撤回。
+* connect-src 放开到 *：插件拿到 network 授权后可以像普通网页一样
+* 自己 fetch / WebSocket / EventSource，不再强制走主进程代理。
 *
-* default-src 'none' 起步，再逐项放开必需的能力。
+* 代价说清楚：流量从此绕开主进程，**宿主看不到也拦不住**。
+* 这是"插件同级权限"必然要接受的交换 —— 想要审计就只能禁掉原生联网。
+*
+* 其余指令仍然从 default-src 'none' 起步逐项放开：
+* 插件没有 frame / object / 表单提交能力，脚本只能加载自己目录里的文件。
 */
 var PLUGIN_CSP = [
 	"default-src 'none'",
@@ -94,7 +98,7 @@ var PLUGIN_CSP = [
 	"style-src 'self' 'unsafe-inline'",
 	"img-src 'self' data:",
 	"font-src 'self' data:",
-	"connect-src 'none'",
+	"connect-src *",
 	"form-action 'none'",
 	"base-uri 'none'",
 	"frame-src 'none'",
@@ -130,6 +134,25 @@ function registerAppSchemePrivileges() {
 			supportFetchAPI: true,
 			corsEnabled: true,
 			stream: true
+		}
+	}, {
+		/*
+		* 背景媒体（图片 / 视频）专用协议。
+		*
+		* 为什么不用 file://：渲染层跑在 app:// 源上，file:// 会被安全策略拦掉；
+		* 为什么不用 data URL：视频动辄几百 MB，base64 会把内存顶穿，而且没法拖动进度条。
+		* stream: true 让 <video> 可以走 Range 请求边下边播。
+		* 只服务"当前选中的那一个文件"，不做目录映射 —— 这样即使渲染层被注入，
+		* 也读不到任意磁盘文件。
+		*/
+		scheme: "sparkle-media",
+		privileges: {
+			standard: true,
+			secure: true,
+			supportFetchAPI: true,
+			corsEnabled: true,
+			stream: true,
+			bypassCSP: true
 		}
 	}]);
 }
@@ -259,8 +282,12 @@ function serveCustomProtocolsForPartition(partition, options) {
 var PLUGIN_PERMISSIONS = [
 	"workspace:read",
 	"workspace:write",
+	"fs:read",
+	"fs:write",
 	"network",
-	"process"
+	"process",
+	"editor",
+	"config"
 ];
 var PLUGIN_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
 var VERSION_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
@@ -430,6 +457,14 @@ var PLUGIN_CHANNELS = {
 	cancel: "plugin:cancel",
 	listSolvers: "plugin:listSolvers",
 	runSolver: "plugin:runSolver",
+	getActiveDocument: "plugin:getActiveDocument",
+	applyEdits: "plugin:applyEdits",
+	formatDocument: "plugin:formatDocument",
+	listFormatters: "plugin:listFormatters",
+	listCommands: "plugin:listCommands",
+	executeCommand: "plugin:executeCommand",
+	editorRequest: "plugin:editorRequest",
+	editorReply: "plugin:editorReply",
 	sandboxActivate: "plugin-sandbox:activate",
 	sandboxRpc: "plugin-sandbox:rpc",
 	sandboxCancel: "plugin-sandbox:cancel",
@@ -441,6 +476,41 @@ var PLUGIN_CHANNELS = {
 	sandboxLog: "plugin-sandbox:log",
 	changed: "plugin:changed"
 };
+var MAX_EDIT_TEXT = 2e4;
+/**
+* 清洗插件发来的编辑列表。
+*
+* 插件的返回值/请求参数都是**跨越隔离边界的不可信输入**，
+* 这里逐项校验并截断，越界的编辑直接丢弃（不是 clamp ——
+* clamp 会让一次错误的编辑悄悄改到文件末尾，比拒绝更糟）。
+*/
+function sanitizeEdits(value) {
+	if (!Array.isArray(value)) return [];
+	const result = [];
+	for (const raw of value) {
+		if (result.length >= 100) break;
+		if (!raw || typeof raw !== "object") continue;
+		const edit = raw;
+		const num = (input) => {
+			const n = Number(input);
+			return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 0;
+		};
+		const startLine = num(edit.startLine);
+		const startColumn = num(edit.startColumn);
+		const endLine = num(edit.endLine);
+		const endColumn = num(edit.endColumn);
+		if (!startLine || !startColumn || !endLine || !endColumn) continue;
+		const text = typeof edit.text === "string" ? edit.text.slice(0, MAX_EDIT_TEXT) : "";
+		result.push({
+			startLine,
+			startColumn,
+			endLine,
+			endColumn,
+			text
+		});
+	}
+	return result;
+}
 /** 插件返回的数据一律当不可信处理：限长、限数量、限深度 */
 var MAX_VIEW_ITEMS = 400;
 var MAX_VIEW_TEXT = 2e4;
@@ -631,6 +701,118 @@ async function readDirectory$1(root, relativePath) {
 		truncated
 	};
 }
+/**
+* 「同级权限」的文件与配置能力。
+*
+* 和 workspace.* 的区别：
+*   · workspace.* 只认工作区内的相对路径，是给"项目插件"用的；
+*   · fs.* 认任意绝对路径，等价于主程序自己手里的 fs。
+*
+* 唯一的硬约束在**写**方向的两处：插件目录和 IDE 自己的设置/授权文件。
+* 前者挡住"插件把自己复制进去，变成卸不掉的常驻程序"，
+* 后者挡住"插件改设置给自己提权"。这两条不是审计，是功能正确性 ——
+* 没有它们，设置里的权限开关可以被插件自己改掉。
+*/
+var MAX_ANY_FILE_BYTES = 64 * 1024 * 1024;
+var MAX_DIR_ENTRIES = 2e3;
+function pluginGuardPaths() {
+	const userData = electron.app.getPath("userData");
+	return {
+		plugins: (0, node_path.join)(userData, "plugins"),
+		files: [
+			(0, node_path.join)(userData, "plugin-grants.json"),
+			(0, node_path.join)(userData, "settings.json")
+		]
+	};
+}
+function pathInside(parent, target) {
+	const rel = (0, node_path.relative)(String(parent).toLowerCase(), String(target).toLowerCase());
+	return rel === "" || (!rel.startsWith("..") && !(0, node_path.isAbsolute)(rel));
+}
+function resolveAnyPath(root, rawPath) {
+	const raw = String(rawPath ?? "").trim();
+	if (!raw) throw new Error("path 不能为空");
+	return (0, node_path.isAbsolute)(raw) ? (0, node_path.resolve)(raw) : (0, node_path.resolve)(root || process.cwd(), raw);
+}
+/**
+* 解析真实路径。
+*
+* 只做字面量比较是不够的：插件可以先在别处建一个指向 settings.json 的符号链接，
+* 再往链接上写 —— 字面上它写的不是受保护文件，实际改的却是。
+* 所以校验必须落在 realpath 上；目标还不存在时，退一步解析它的父目录。
+*/
+async function realTarget(target) {
+	try {
+		return await (0, node_fs_promises.realpath)(target);
+	} catch {
+		try {
+			const dir = await (0, node_fs_promises.realpath)((0, node_path.dirname)(target));
+			return (0, node_path.join)(dir, (0, node_path.basename)(target));
+		} catch {
+			return target;
+		}
+	}
+}
+async function assertWritable(target) {
+	const real = await realTarget(target);
+	const guard = pluginGuardPaths();
+	const pluginsReal = await realTarget(guard.plugins);
+	if (pathInside(pluginsReal, real)) throw new Error(`拒绝写入插件目录：${real}（插件不能给自己写新版本）`);
+	for (const file of guard.files) {
+		const fileReal = await realTarget(file);
+		if (String(fileReal).toLowerCase() === String(real).toLowerCase()) throw new Error(`拒绝直接写入 ${(0, node_path.basename)(fileReal)}：改设置请用 config.set`);
+	}
+}
+async function fsReadAny(target, encoding) {
+	let info;
+	try {
+		info = await (0, node_fs_promises.stat)(target);
+	} catch {
+		throw new Error(`文件不存在：${target}`);
+	}
+	if (info.isDirectory()) throw new Error(`这是一个目录，请用 fs.readdir：${target}`);
+	if (info.size > MAX_ANY_FILE_BYTES) throw new Error(`文件太大（${info.size} 字节，上限 ${MAX_ANY_FILE_BYTES}）`);
+	const buffer = await (0, node_fs_promises.readFile)(target);
+	const wantBase64 = String(encoding || "utf8") === "base64";
+	return {
+		path: target,
+		bytes: buffer.byteLength,
+		binary: buffer.subarray(0, 8e3).includes(0),
+		encoding: wantBase64 ? "base64" : "utf8",
+		content: wantBase64 ? buffer.toString("base64") : buffer.toString("utf8")
+	};
+}
+async function fsWriteAny(target, content, encoding) {
+	await assertWritable(target);
+	const data = String(encoding || "utf8") === "base64" ? Buffer.from(String(content ?? ""), "base64") : String(content ?? "");
+	await (0, node_fs_promises.mkdir)((0, node_path.dirname)(target), { recursive: true });
+	await (0, node_fs_promises.writeFile)(target, data);
+	return {
+		path: target,
+		bytes: Buffer.byteLength(data)
+	};
+}
+function pluginGrantsPath() {
+	return (0, node_path.join)(electron.app.getPath("userData"), "plugin-grants.json");
+}
+async function loadPluginGrants() {
+	try {
+		const text = await (0, node_fs_promises.readFile)(pluginGrantsPath(), "utf8");
+		const parsed = JSON.parse(text.replace(/^\uFEFF/, ""));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+async function savePluginGrants(map) {
+	try {
+		const file = pluginGrantsPath();
+		await (0, node_fs_promises.mkdir)((0, node_path.dirname)(file), { recursive: true });
+		await (0, node_fs_promises.writeFile)(file, `${JSON.stringify(map, null, 2)}\n`, "utf8");
+	} catch (error) {
+		console.log(`[plugins] 保存授权失败：${error instanceof Error ? error.message : String(error)}`);
+	}
+}
 async function readFileContent$1(root, relativePath) {
 	const target = resolveInside(root, relativePath);
 	const info = await (0, node_fs_promises.stat)(target);
@@ -700,7 +882,7 @@ async function discoverPlugins(roots) {
 			}
 			let parsed;
 			try {
-				parsed = JSON.parse(rawText);
+				parsed = JSON.parse(rawText.replace(/^\uFEFF/, ""));
 			} catch (error) {
 				broken.push({
 					directory,
@@ -1002,6 +1184,25 @@ var MAX_NETWORK_BYTES = 524288;
 var MAX_ACTIVE_SANDBOXES = Number(process.env.SPARKLE_MAX_ACTIVE_PLUGINS ?? 8);
 /** 算法可能跑得久一些（比如 Floyd 或树形 DP），给足时间 */
 var SOLVER_TIMEOUT_MS = 15e3;
+/**
+* 插件请求编辑器操作（读文档 / 改代码）的超时。
+* 比求解器短：这类操作要么立刻完成，要么说明渲染层有问题，
+* 拖久了只会让插件和用户都卡着。
+*/
+var EDITOR_REQUEST_TIMEOUT_MS = 5e3;
+/** 格式化可能处理大文件，而且可能等外部工具，给宽一点 */
+var FORMAT_TIMEOUT_MS = 2e4;
+/**
+* 命令执行的超时。
+* 命令可能触发一次编辑（快），也可能做点计算（稍慢），
+* 但它是**用户主动点的**，拖太久只会让人以为卡死。
+*/
+var COMMAND_TIMEOUT_MS = 1e4;
+var editorRequestSeq = 0;
+function newEditorRequestId() {
+	editorRequestSeq += 1;
+	return `edit-${Date.now().toString(36)}-${editorRequestSeq}`;
+}
 var PluginHost = class {
 	options;
 	records = /* @__PURE__ */ new Map();
@@ -1012,6 +1213,20 @@ var PluginHost = class {
 	activating = /* @__PURE__ */ new Map();
 	/** 渲染层的补全请求 id → 已转发给哪些插件的哪些内部请求 */
 	cancelRoutes = /* @__PURE__ */ new Map();
+	/**
+	* 语言 id → 注册了格式化器的插件 id。
+	* 同一个语言有多个插件注册时，**先注册的胜出**（和补全的合并语义不同 ——
+	* 格式化只能有一个结果，合并两个格式化器没有意义）。
+	*/
+	formatters = /* @__PURE__ */ new Map();
+	/** 命令 id → 注册它的插件 id */
+	commands = /* @__PURE__ */ new Map();
+	/**
+	* 被用户停用的插件 id。
+	* 停用 = 不激活沙箱、不参与补全/求解器/格式化/命令，
+	* 等价于"装了这个插件但现在不想让它工作"。
+	*/
+	disabled = /* @__PURE__ */ new Set();
 	idleTimer = null;
 	initialized = false;
 	constructor(options) {
@@ -1021,8 +1236,10 @@ var PluginHost = class {
 		if (this.initialized) return;
 		this.initialized = true;
 		const { records, broken } = await discoverPlugins(this.options.roots);
+		const storedGrants = await loadPluginGrants();
 		this.records.clear();
 		for (const record of records) {
+			record.granted = intersectGranted(record.manifest, storedGrants[record.manifest.id] ?? []);
 			this.records.set(record.manifest.id, record);
 			this.options.registerOrigin(record.manifest.id, record.directory);
 		}
@@ -1043,13 +1260,26 @@ var PluginHost = class {
 		const changed = next.length !== record.granted.length || next.some((p) => !record.granted.includes(p));
 		record.granted = next;
 		if (changed && this.sandboxes.has(id)) this.deactivate(id);
+		this.persistGrants();
 		this.push();
 		return this.list();
+	}
+	/**
+	* 把当前授权写进 userData/plugin-grants.json。
+	*
+	* 不落盘的话"用户在设置里限制插件权限"这件事重启一次就白做了 ——
+	* 而授权恰恰是最该记得住的偏好。
+	*/
+	persistGrants() {
+		const map = {};
+		for (const record of this.records.values()) if (record.granted.length > 0) map[record.manifest.id] = record.granted;
+		this.grantWrite = (this.grantWrite ?? Promise.resolve()).then(() => savePluginGrants(map)).catch(() => {});
 	}
 	requirePermission(record, permission) {
 		if (!record.granted.includes(permission)) throw new Error(`插件「${record.manifest.name}」没有 ${permission} 权限。请在插件面板里查看它申请的权限并授权。`);
 	}
 	async activate(id, reason = "manual") {
+		if (!this.isEnabled(id)) return;
 		const record = this.records.get(id);
 		if (!record) throw new Error(`未找到插件 ${id}`);
 		if (this.sandboxes.get(id)?.alive) return;
@@ -1085,6 +1315,17 @@ var PluginHost = class {
 						console.log(`[plugin:${id}] 求解器元数据无法解析，已忽略`);
 					}
 					console.log(`[plugin:${id}] 注册了求解器`);
+				} else if (kind === "formatter") {
+					if (!this.formatters.has(value)) {
+						this.formatters.set(value, id);
+						console.log(`[plugin:${id}] 注册了 ${value} 的格式化器`);
+					} else console.log(`[plugin:${id}] 语言 ${value} 已有格式化器（${this.formatters.get(value)}），忽略`);
+				} else if (kind === "command") {
+					const commandId = String(value);
+					if (!this.commands.has(commandId)) {
+						this.commands.set(commandId, id);
+						console.log(`[plugin:${id}] 注册了命令 ${commandId}`);
+					} else console.log(`[plugin:${id}] 命令 ${commandId} 已被 ${this.commands.get(commandId)} 注册，忽略`);
 				}
 			},
 			onDebug: (event) => this.options.onPluginDebug?.(`${id}: ${event}`)
@@ -1102,7 +1343,8 @@ var PluginHost = class {
 			console.log(`[plugin:${id}] 已激活（触发原因：${reason}）`);
 			this.enforceActiveLimit(id);
 		} catch (error) {
-			this.recordError(record, error instanceof Error ? error.message : String(error));
+			if (!record.error) this.recordError(record, error instanceof Error ? error.message : String(error));
+			else record.state = "error";
 			this.teardownSandbox(id);
 		}
 		this.push();
@@ -1172,8 +1414,10 @@ var PluginHost = class {
 	* 否则用户打开面板会看到一片空白，以为插件坏了。
 	*/
 	async listSolvers() {
-		const withSolvers = [...this.records.values()].filter((record) => record.state !== "error" && (record.solvers.size > 0 || record.state !== "active"));
-		await Promise.all(withSolvers.map((record) => this.activate(record.manifest.id, "onSolverPanel").catch(() => {})));
+		const withSolvers = [...this.records.values()].filter((record) => this.isEnabled(record.manifest.id) && record.state !== "error" && (record.solvers.size > 0 || record.state !== "active"));
+		await Promise.all(withSolvers.map((record) => this.activate(record.manifest.id, "onSolverPanel").catch((error) => {
+			this.options.onPluginLog?.(record.manifest.id, `激活失败：${error instanceof Error ? error.message : String(error)}`);
+		})));
 		const result = [];
 		for (const record of this.records.values()) for (const metadata of record.solvers.values()) try {
 			const parsed = JSON.parse(metadata);
@@ -1216,10 +1460,116 @@ var PluginHost = class {
 			throw new Error(`求解失败：${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
+	/** 哪些语言有格式化器（供渲染层决定「格式化」按钮是否可用） */
+	listFormatters() {
+		return Object.fromEntries(this.formatters);
+	}
+	/**
+	* 用插件格式化一段文本。
+	*
+	* 找不到格式化器时返回 null —— 渲染层据此回退到 Monaco 自带的
+	* （HTML / CSS / JSON / TypeScript 在 monaco-editor 里是有内置格式化器的）。
+	*/
+	async formatDocument(languageId, content) {
+		const pluginId = this.formatters.get(languageId);
+		if (!pluginId) return null;
+		if (!this.isEnabled(pluginId)) return null;
+		const record = this.records.get(pluginId);
+		if (!record) return null;
+		if (record.state === "error") throw new Error(`插件「${record.manifest.name}」处于错误状态：${record.error ?? "未知原因"}`);
+		await this.activate(pluginId, `onLanguage:${languageId}`);
+		const sandbox = this.sandboxes.get(pluginId);
+		if (!sandbox?.alive) throw new Error(`插件「${record.manifest.name}」的沙箱没有启动成功`);
+		const { result } = sandbox.request("formatDocument", {
+			languageId,
+			content: String(content ?? "").slice(0, 4e5)
+		}, FORMAT_TIMEOUT_MS);
+		try {
+			const formatted = await result;
+			if (typeof formatted !== "string") throw new Error("格式化器必须返回字符串");
+			return formatted;
+		} catch (error) {
+			throw new Error(`格式化失败：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	/**
+	* 应用"停用哪些插件"。
+	*
+	* 停用立刻拆掉沙箱（不只是记个标记）：
+	* 否则插件手里还握着已注册的求解器/格式化器，界面上看着"停用了"却还在工作，
+	* 那是最容易让人困惑的状态。
+	*/
+	setDisabled(ids) {
+		const next = new Set(ids.filter((id) => typeof id === "string" && id));
+		for (const id of this.disabled) if (!next.has(id)) continue;
+		for (const id of next) {
+			if (this.disabled.has(id)) continue;
+			this.teardownSandbox(id);
+			for (const [language, pluginId] of [...this.formatters]) if (pluginId === id) this.formatters.delete(language);
+			for (const [commandId, pluginId] of [...this.commands]) if (pluginId === id) this.commands.delete(commandId);
+			const record = this.records.get(id);
+			if (record) {
+				record.solvers.clear();
+				record.state = "inactive";
+				record.sandboxAlive = false;
+			}
+		}
+		this.disabled.clear();
+		for (const id of next) this.disabled.add(id);
+		this.push();
+	}
+	isEnabled(id) {
+		return !this.disabled.has(id);
+	}
+	/**
+	* 列出**已注册**的插件命令。
+	*
+	* 为什么只列已注册的：清单里的 contributes.commands 只是"声明"，
+	* 插件真正调用 registerCommand 之后才可执行。
+	* 把声明过但没实现的命令显示给用户，点下去只会报错 —— 不如不显示。
+	*/
+	listCommands() {
+		const pending = [...this.records.values()].filter((record) => this.isEnabled(record.manifest.id) && record.state !== "error" && (record.manifest.contributes?.commands?.length ?? 0) > 0);
+		for (const record of pending) this.activate(record.manifest.id, "onCommand").catch(() => {});
+		const result = [];
+		for (const [commandId, pluginId] of this.commands) {
+			const record = this.records.get(pluginId);
+			if (!record) continue;
+			if (!this.isEnabled(pluginId)) continue;
+			const declared = (record.manifest.contributes?.commands ?? []).find((command) => command.id === commandId);
+			result.push({
+				id: commandId,
+				title: declared?.title ?? commandId,
+				pluginId,
+				pluginName: record.manifest.name
+			});
+		}
+		return result.sort((a, b) => a.title.localeCompare(b.title));
+	}
+	/** 执行一个插件命令。返回给用户看的提示文字（可为空） */
+	async executeCommand(commandId) {
+		const pluginId = this.commands.get(commandId);
+		if (!pluginId) throw new Error(`找不到命令 ${commandId}。可能它所属的插件没有启用。`);
+		if (!this.isEnabled(pluginId)) throw new Error(`命令 ${commandId} 所属的插件已被停用`);
+		const record = this.records.get(pluginId);
+		if (!record) throw new Error("插件记录已失效");
+		if (record.state === "error") throw new Error(`插件「${record.manifest.name}」处于错误状态：${record.error ?? "未知原因"}`);
+		await this.activate(pluginId, "onCommand");
+		const sandbox = this.sandboxes.get(pluginId);
+		if (!sandbox?.alive) throw new Error(`插件「${record.manifest.name}」的沙箱没有启动成功`);
+		const { result } = sandbox.request("runCommand", { commandId }, COMMAND_TIMEOUT_MS);
+		try {
+			const value = await result;
+			return typeof value === "string" ? value : "";
+		} catch (error) {
+			throw new Error(`命令执行失败：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
 	/** 哪些插件可能提供该语言的补全：已注册的 + 声明了 onLanguage 的 */
 	providersFor(languageId) {
 		const result = [];
 		for (const record of this.records.values()) {
+			if (!this.isEnabled(record.manifest.id)) continue;
 			const registered = this.sandboxes.get(record.manifest.id)?.completionLanguages.has(languageId) ?? false;
 			const declares = shouldActivate(record.manifest, `onLanguage:${languageId}`);
 			if (registered || declares) result.push(record);
@@ -1361,6 +1711,125 @@ var PluginHost = class {
 			case "network.fetch":
 				this.requirePermission(record, "network");
 				return this.brokerFetch(String(params.url ?? ""), params);
+			case "editor.getActiveDocument":
+				this.requirePermission(record, "editor");
+				return this.options.requestRenderer(newEditorRequestId(), { kind: "getActiveDocument" }, EDITOR_REQUEST_TIMEOUT_MS);
+			case "editor.applyEdits": {
+				this.requirePermission(record, "editor");
+				const edits = sanitizeEdits(params.edits);
+				if (edits.length === 0) throw new Error("applyEdits 需要至少一处有效编辑（行列都从 1 开始）");
+				return this.options.requestRenderer(newEditorRequestId(), {
+					kind: "applyEdits",
+					path: String(params.path ?? ""),
+					version: Number(params.version ?? -1),
+					edits
+				}, EDITOR_REQUEST_TIMEOUT_MS);
+			}
+			case "fs.readFile": {
+				this.requirePermission(record, "fs:read");
+				return await fsReadAny(resolveAnyPath(this.options.currentWorkspaceRoot(), params.path), params.encoding);
+			}
+			case "fs.writeFile": {
+				this.requirePermission(record, "fs:write");
+				return await fsWriteAny(resolveAnyPath(this.options.currentWorkspaceRoot(), params.path), params.content, params.encoding);
+			}
+			case "fs.readdir": {
+				this.requirePermission(record, "fs:read");
+				const target = resolveAnyPath(this.options.currentWorkspaceRoot(), params.path);
+				const dirents = await (0, node_fs_promises.readdir)(target, { withFileTypes: true });
+				return {
+					path: target,
+					truncated: dirents.length > MAX_DIR_ENTRIES,
+					entries: dirents.slice(0, MAX_DIR_ENTRIES).map((dirent) => ({
+						name: dirent.name,
+						isFile: dirent.isFile(),
+						isDirectory: dirent.isDirectory()
+					}))
+				};
+			}
+			case "fs.stat": {
+				this.requirePermission(record, "fs:read");
+				const target = resolveAnyPath(this.options.currentWorkspaceRoot(), params.path);
+				try {
+					const info = await (0, node_fs_promises.stat)(target);
+					return {
+						exists: true,
+						path: target,
+						isFile: info.isFile(),
+						isDirectory: info.isDirectory(),
+						size: info.size,
+						mtimeMs: info.mtimeMs
+					};
+				} catch {
+					return {
+						exists: false,
+						path: target
+					};
+				}
+			}
+			case "fs.mkdir": {
+				this.requirePermission(record, "fs:write");
+				const target = resolveAnyPath(this.options.currentWorkspaceRoot(), params.path);
+				await assertWritable(target);
+				await (0, node_fs_promises.mkdir)(target, { recursive: true });
+				return {
+					ok: true,
+					path: target
+				};
+			}
+			case "fs.rename": {
+				this.requirePermission(record, "fs:write");
+				const root = this.options.currentWorkspaceRoot();
+				const from = resolveAnyPath(root, params.from);
+				const to = resolveAnyPath(root, params.to);
+				await assertWritable(from);
+				await assertWritable(to);
+				await (0, node_fs_promises.rename)(from, to);
+				return {
+					ok: true,
+					from,
+					to
+				};
+			}
+			case "fs.unlink": {
+				this.requirePermission(record, "fs:write");
+				const target = resolveAnyPath(this.options.currentWorkspaceRoot(), params.path);
+				await assertWritable(target);
+				const info = await (0, node_fs_promises.stat)(target);
+				if (info.isDirectory()) throw new Error("fs.unlink 只删文件；目录请逐个删里面的文件");
+				await (0, node_fs_promises.unlink)(target);
+				return {
+					ok: true,
+					path: target
+				};
+			}
+			case "config.get": {
+				this.requirePermission(record, "config");
+				return await loadSettings(electron.app.getPath("userData"));
+			}
+			case "config.set": {
+				this.requirePermission(record, "config");
+				const rawPatch = params.patch;
+				if (!rawPatch || typeof rawPatch !== "object" || Array.isArray(rawPatch)) throw new Error("config.set 需要一个 patch 对象");
+				if (Object.prototype.hasOwnProperty.call(rawPatch, "disabledPlugins")) throw new Error("插件不能修改 disabledPlugins（否则可以给自己或别的插件提权）");
+				const allowedKeys = new Set(Object.keys(DEFAULT_SETTINGS));
+				const patch = {};
+				const rejected = [];
+				for (const key of Object.keys(rawPatch)) {
+					if (key === "disabledPlugins") rejected.push(key);
+					else if (allowedKeys.has(key)) patch[key] = rawPatch[key];
+					else rejected.push(key);
+				}
+				const userData = electron.app.getPath("userData");
+				const current = await loadSettings(userData);
+				const saved = await saveSettings(userData, Object.assign({}, current, patch));
+				sendToRenderer("settings:changed", saved);
+				return {
+					...saved,
+					applied: Object.keys(patch),
+					rejected
+				};
+			}
 			case "process.exec": throw new Error("process 权限尚未开放：本版本不代理启动本机程序");
 			default: throw new Error(`未知的能力方法：${method}`);
 		}
@@ -1540,7 +2009,7 @@ var UNAVAILABLE = {
 	executable: "",
 	invocation: ""
 };
-var cached$2;
+var cached$3;
 function tryCandidate(candidate) {
 	const versionRun = (0, node_child_process.spawnSync)(candidate.command, [...candidate.args, "--version"], {
 		encoding: "utf8",
@@ -1573,15 +2042,15 @@ function tryCandidate(candidate) {
 }
 /** 找到第一个真正可用的解释器。结果会缓存。 */
 function resolveInterpreter(force = false) {
-	if (!force && cached$2 !== void 0) return cached$2;
+	if (!force && cached$3 !== void 0) return cached$3;
 	for (const candidate of CANDIDATES) {
 		const found = tryCandidate(candidate);
 		if (found) {
-			cached$2 = found;
+			cached$3 = found;
 			return found;
 		}
 	}
-	cached$2 = null;
+	cached$3 = null;
 	return null;
 }
 /** 给渲染层看的安全信息（不带内部命令细节） */
@@ -1795,6 +2264,36 @@ var BENCH_CHANNELS = {
 * 所以刻意做得非常薄 —— 真正有逻辑的部分都在可测试的 fileService 里。
 */
 var workspaceRoot = null;
+
+/** 上次打开的文件夹记在这里（独立文件，和 settings.json 互不干扰） */
+function lastWorkspaceFile() {
+	return (0, node_path.join)(electron.app.getPath("userData"), "last-workspace.json");
+}
+function rememberWorkspace(directory) {
+	try {
+		const file = lastWorkspaceFile();
+		if (!directory) {
+			try {
+				node_fs.unlinkSync(file);
+			} catch {}
+			return;
+		}
+		node_fs.writeFileSync(file, `${JSON.stringify({ path: (0, node_path.resolve)(directory) }, null, 2)}\n`, "utf8");
+	} catch {}
+}
+/** 启动时调用：目录还在就恢复，不在（被删 / 被移动）就当没打开过 */
+function restoreWorkspace() {
+	try {
+		const raw = JSON.parse(node_fs.readFileSync(lastWorkspaceFile(), "utf8").replace(/^\uFEFF/, ""));
+		const dir = typeof raw?.path === "string" ? raw.path : "";
+		if (!dir) return null;
+		if (!node_fs.statSync(dir).isDirectory()) return null;
+		workspaceRoot = (0, node_path.resolve)(dir);
+		return workspaceRoot;
+	} catch {
+		return null;
+	}
+}
 function currentWorkspace() {
 	return {
 		root: workspaceRoot,
@@ -1804,6 +2303,7 @@ function currentWorkspace() {
 /** 基准测试用：不经对话框直接设定工作区根目录 */
 function setWorkspaceRoot(directory) {
 	workspaceRoot = (0, node_path.resolve)(directory);
+	rememberWorkspace(workspaceRoot);
 	return currentWorkspace();
 }
 async function openFolder(window) {
@@ -1814,6 +2314,7 @@ async function openFolder(window) {
 	const result = window ? await electron.dialog.showOpenDialog(window, options) : await electron.dialog.showOpenDialog(options);
 	if (result.canceled || result.filePaths.length === 0) return currentWorkspace();
 	workspaceRoot = (0, node_path.resolve)(result.filePaths[0]);
+	rememberWorkspace(workspaceRoot);
 	return currentWorkspace();
 }
 function requireRoot() {
@@ -1850,24 +2351,24 @@ var TOOLCHAIN_CHANNELS = {
 function configPath() {
 	return (0, node_path.join)(electron.app.getPath("userData"), "toolchain.json");
 }
-var cached$1 = null;
+var cached$2 = null;
 function loadToolchainConfig() {
-	if (cached$1) return cached$1;
+	if (cached$2) return cached$2;
 	try {
 		const raw = (0, node_fs.readFileSync)(configPath(), "utf8");
 		const parsed = JSON.parse(raw);
-		cached$1 = typeof parsed === "object" && parsed !== null ? parsed : {};
+		cached$2 = typeof parsed === "object" && parsed !== null ? parsed : {};
 	} catch {
-		cached$1 = {};
+		cached$2 = {};
 	}
-	return cached$1;
+	return cached$2;
 }
 function saveToolchainConfig(update) {
 	const next = {
 		...loadToolchainConfig(),
 		...update
 	};
-	cached$1 = next;
+	cached$2 = next;
 	try {
 		const file = configPath();
 		(0, node_fs.mkdirSync)((0, node_path.dirname)(file), { recursive: true });
@@ -1878,11 +2379,11 @@ function saveToolchainConfig(update) {
 	return next;
 }
 function clearToolchainConfig() {
-	cached$1 = {};
+	cached$2 = {};
 	try {
 		(0, node_fs.writeFileSync)(configPath(), "{}", "utf8");
 	} catch {}
-	return cached$1;
+	return cached$2;
 }
 /** 手动指定的路径是否还有效（用户可能把编译器删了） */
 function isValidExecutable(path) {
@@ -1895,8 +2396,23 @@ var TOOL_PACKAGES = {
 		id: "gcc",
 		name: "MinGW-w64 GCC (WinLibs)",
 		version: "16.2.0",
-		url: "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r2/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r2.7z",
-		approximateBytes: 109762824,
+		/*
+		* WinLibs 的 UCRT + posix 线程 + SEH 异常版本，是现在 Windows 上最省事的
+		* MinGW-w64 组合：支持 C++26、中文标识符、std::thread。
+		*
+		* 为什么列多个地址：GitHub Releases 在国内经常连不上或者几十 KB/s，
+		* 而下载编译器是"装完就能用"的关键路径。第一个直连失败就自动换镜像，
+		* 全都失败才报错 —— 用户不需要知道镜像这回事。
+		*
+		* 7z 比 zip 小一半多（106 MB vs 264 MB），所以选 7z，解压用随包的 7za.exe。
+		*/
+		urls: [
+			"https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.7z",
+			"https://ghfast.top/https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.7z",
+			"https://gh-proxy.com/https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.7z",
+			"https://mirror.ghproxy.com/https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.7z"
+		],
+		approximateBytes: 1065e5,
 		archive: "7z",
 		probeRelative: "bin/g++.exe",
 		probeArgs: ["--version"],
@@ -2344,8 +2860,14 @@ function detectTools(options) {
 //#region src/main/toolchain/installer.ts
 /** 进度上报的最小间隔，避免每收一个 chunk 就发一次 IPC */
 var PROGRESS_INTERVAL_MS = 200;
-/** 单次连接的超时，避免网络卡住时一直挂着 */
-var CONNECT_TIMEOUT_MS = 6e4;
+/**
+* 单次连接的超时。
+*
+* 从 60 秒降到 15 秒是实测结论：国内直连 GitHub Releases 经常是 TCP 握手就挂住，
+* 60 秒意味着用户要盯着"准备下载"干等一分钟才轮到镜像。
+* 真正的慢速下载不受影响 —— 只要开始收数据，走的是下面的 STALL_TIMEOUT_MS 看门狗。
+*/
+var CONNECT_TIMEOUT_MS = 15e3;
 /** 最多跟随几次重定向（SourceForge 会 302 到镜像站） */
 var MAX_REDIRECTS = 6;
 function report(context, toolId, phase, message, receivedBytes = 0, totalBytes = null) {
@@ -2394,7 +2916,8 @@ function openStream(url, signal, depth = 0) {
 			const headerLength = Number(response.headers["content-length"]);
 			resolve({
 				stream: response,
-				totalBytes: Number.isFinite(headerLength) && headerLength > 0 ? headerLength : null
+				totalBytes: Number.isFinite(headerLength) && headerLength > 0 ? headerLength : null,
+				request
 			});
 		});
 		const onAbort = () => {
@@ -2411,20 +2934,44 @@ function openStream(url, signal, depth = 0) {
 		});
 	});
 }
-/** 流式下载到文件，同时上报进度并支持取消 */
+/**
+* 流式下载到文件，同时上报进度并支持取消。
+*
+* 还带一个"卡住就放弃"的看门狗：国内直连 GitHub 经常是**连上了但不给数据**，
+* 连接超时管不到这种情况，用户会看着 0.0 MB 干等好几分钟。
+* 30 秒收不到任何字节就主动断开，让上层换下一条线路。
+*/
+var STALL_TIMEOUT_MS = 3e4;
 async function downloadTo(url, targetPath, toolId, context, label) {
-	const { stream, totalBytes } = await openStream(url, context.signal);
+	const { stream, totalBytes, request } = await openStream(url, context.signal);
 	let receivedBytes = 0;
 	let lastReportAt = 0;
+	let lastDataAt = Date.now();
+	let stalled = false;
+	const watchdog = setInterval(() => {
+		if (Date.now() - lastDataAt < STALL_TIMEOUT_MS) return;
+		stalled = true;
+		try {
+			request.destroy(/* @__PURE__ */ new Error(`下载卡住（${STALL_TIMEOUT_MS / 1e3} 秒没有收到数据）`));
+		} catch {}
+	}, 5e3);
 	stream.on("data", (chunk) => {
 		receivedBytes += chunk.length;
+		lastDataAt = Date.now();
 		const now = Date.now();
 		if (now - lastReportAt >= PROGRESS_INTERVAL_MS) {
 			lastReportAt = now;
 			report(context, toolId, "downloading", `${label} 下载中… ${(receivedBytes / 1024 / 1024).toFixed(1)} MB` + (totalBytes ? ` / ${(totalBytes / 1024 / 1024).toFixed(1)} MB` : ""), receivedBytes, totalBytes);
 		}
 	});
-	await (0, node_stream_promises.pipeline)(stream, (0, node_fs.createWriteStream)(targetPath), { signal: context.signal });
+	try {
+		await (0, node_stream_promises.pipeline)(stream, (0, node_fs.createWriteStream)(targetPath), { signal: context.signal });
+	} catch (error) {
+		if (stalled) throw new Error(`${label} 下载卡住，已切换线路（已收到 ${(receivedBytes / 1024 / 1024).toFixed(1)} MB）`);
+		throw error;
+	} finally {
+		clearInterval(watchdog);
+	}
 	report(context, toolId, "downloading", `${label} 下载完成（${(receivedBytes / 1024 / 1024).toFixed(1)} MB）`, receivedBytes, totalBytes ?? receivedBytes);
 }
 /** 解压。zip 用系统自带的 bsdtar（实测支持 zip），7z 用随包收录的 7za */
@@ -2504,7 +3051,28 @@ async function installTool(toolId, context) {
 	const archivePath = (0, node_path.join)(stagingDir, pkg.archive === "7z" ? "package.7z" : "package.zip");
 	const targetDir = (0, node_path.resolve)(context.root, toolId);
 	try {
-		await downloadTo(pkg.url, archivePath, toolId, context, pkg.name);
+		/*
+		* 多线路下载：pkg.urls 里按顺序试，前一条失败（DNS / 超时 / 404 / 连接重置）
+		* 就换下一条，全失败才把最后一条的错误抛给用户。
+		* 这是国内下载 GitHub Releases 的必要设计 —— 直连经常几十 KB/s 甚至直接失败。
+		*/
+		const sources = Array.isArray(pkg.urls) && pkg.urls.length > 0 ? pkg.urls : [pkg.url];
+		let lastError = null;
+		for (let index = 0; index < sources.length; index += 1) {
+			if (context.signal.aborted) throw new Error("已取消");
+			try {
+				const label = sources.length > 1 ? `${pkg.name}（线路 ${index + 1}/${sources.length}）` : pkg.name;
+				await downloadTo(sources[index], archivePath, toolId, context, label);
+				lastError = null;
+				break;
+			} catch (error) {
+				if (context.signal.aborted) throw error;
+				lastError = error;
+				await (0, node_fs_promises.rm)(archivePath, { force: true }).catch(() => {});
+				report(context, toolId, "resolving", `线路 ${index + 1} 不可用（${error instanceof Error ? error.message : String(error)}），正在换下一条…`);
+			}
+		}
+		if (lastError) throw new Error(`所有下载线路都失败了：${lastError instanceof Error ? lastError.message : String(lastError)}`);
 		if (context.signal.aborted) throw new Error("已取消");
 		report(context, toolId, "extracting", pkg.archive === "7z" ? "正在解压（大约需要十几秒）…" : "正在解压…");
 		await (0, node_fs_promises.rm)(targetDir, {
@@ -2543,7 +3111,7 @@ async function installTool(toolId, context) {
 * 自动发现不可能覆盖所有情况，而且本机实测遇到过
 * "沙箱禁止子进程列出盘符根目录"这类会让扫描漏掉整个盘的限制。
 */
-var cached = null;
+var cached$1 = null;
 var activeInstall = null;
 function toolRoot() {
 	return (0, node_path.join)(electron.app.getPath("userData"), "toolchains");
@@ -2560,18 +3128,18 @@ function sevenZipPath() {
 	return (0, node_path.join)(electron.app.getAppPath(), "vendor", "7za.exe");
 }
 function runDetect(force) {
-	if (!force && cached) return cached;
+	if (!force && cached$1) return cached$1;
 	const config = loadToolchainConfig();
 	const startedAt = Date.now();
-	cached = detectTools({
+	cached$1 = detectTools({
 		toolRoot: toolRoot(),
 		bundledRoot: bundledToolRoot(),
 		manualGccPath: isValidExecutable(config.manualGccPath) ? config.manualGccPath : void 0,
 		manualPythonPath: isValidExecutable(config.manualPythonPath) ? config.manualPythonPath : void 0,
 		preferredGccPath: config.preferredGccPath
 	});
-	console.log(`[toolchain] 探测完成：${Date.now() - startedAt} ms，找到 ${cached.compilers.length} 个编译器，选中 ${cached.selectedCompiler?.version ?? "（无）"}`);
-	return cached;
+	console.log(`[toolchain] 探测完成：${Date.now() - startedAt} ms，找到 ${cached$1.compilers.length} 个编译器，选中 ${cached$1.selectedCompiler?.version ?? "（无）"}`);
+	return cached$1;
 }
 function detect(force = false) {
 	return runDetect(force).tools;
@@ -2605,7 +3173,7 @@ function registerToolchainIpc(notify, getWindow) {
 				onProgress: notify,
 				signal: controller.signal
 			});
-			cached = null;
+			cached$1 = null;
 			return {
 				ok: true,
 				version: result.version,
@@ -2645,7 +3213,7 @@ function registerToolchainIpc(notify, getWindow) {
 			recursive: true,
 			force: true
 		});
-		cached = null;
+		cached$1 = null;
 		return {
 			ok: true,
 			tools: detect(true)
@@ -2681,7 +3249,7 @@ function registerToolchainIpc(notify, getWindow) {
 			preferredGccPath: picked
 		});
 		else saveToolchainConfig({ manualPythonPath: picked });
-		cached = null;
+		cached$1 = null;
 		return {
 			ok: true,
 			path: picked,
@@ -2699,7 +3267,7 @@ function registerToolchainIpc(notify, getWindow) {
 				preferredGccPath: ""
 			});
 		} else saveToolchainConfig({ manualPythonPath: path });
-		cached = null;
+		cached$1 = null;
 		return {
 			ok: true,
 			tools: detect(true)
@@ -2707,7 +3275,7 @@ function registerToolchainIpc(notify, getWindow) {
 	});
 	electron.ipcMain.handle(TOOLCHAIN_CHANNELS.selectCandidate, (_event, executable) => {
 		saveToolchainConfig({ preferredGccPath: executable });
-		cached = null;
+		cached$1 = null;
 		return {
 			ok: true,
 			tools: detect(true)
@@ -2715,7 +3283,7 @@ function registerToolchainIpc(notify, getWindow) {
 	});
 	electron.ipcMain.handle("toolchain:reset", () => {
 		clearToolchainConfig();
-		cached = null;
+		cached$1 = null;
 		return {
 			ok: true,
 			tools: detect(true)
@@ -2979,7 +3547,6 @@ async function ensureCMakeLists(root, project) {
 		created: false,
 		content: await (0, node_fs_promises.readFile)(cmakePath, "utf8")
 	};
-	const settings = await loadSettings();
 	const sources = (await (0, node_fs_promises.readdir)(absoluteDirectory).catch(() => [])).filter((name) => isCppSource(name)).sort();
 	const sourceList = sources.length > 0 ? sources : [(0, node_path.basename)(project.entry)];
 	const projectName = (project.directory ? (0, node_path.basename)(project.directory) : "sparkle_app").replace(/[^A-Za-z0-9_]/g, "_");
@@ -2991,7 +3558,15 @@ async function ensureCMakeLists(root, project) {
 		"",
 		`project(${projectName || "sparkle_app"} CXX)`,
 		"",
-		...standardCmakeOptions(settings.cppStandard),
+		"# 按编译器版本挑 C++ 标准。",
+		"# GCC 5 起才支持 C++17；Dev-Cpp 自带的 GCC 4.9 只到 C++14，",
+		"# 硬写 17 会直接报 \"unrecognized command line option -std=c++17\"。",
+		"if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 5)",
+		"    set(CMAKE_CXX_STANDARD 17)",
+		"else()",
+		"    set(CMAKE_CXX_STANDARD 14)",
+		"endif()",
+		"set(CMAKE_CXX_STANDARD_REQUIRED ON)",
 		"",
 		"# 打开常用警告（只是提醒，不会因为警告就编译失败）",
 		"if(NOT MSVC)",
@@ -3608,95 +4183,21 @@ function runCommand(command, args, options) {
 * "unrecognized command line option '-std=c++17'"，编译必然失败。
 * 如果用户机器上只有这一个编译器，那就是"怎么点都编译不了"。
 */
-/** 用户可以在「设置」里指定的 C++ 标准。c++26 需要 GCC 15+，指定了但编译器
-* 不支持时不会让编译直接失败，而是沿阶梯降到编译器真正支持的最高标准。 */
-var SUPPORTED_STANDARDS = ["c++11", "c++14", "c++17", "c++20", "c++23", "c++26"];
-/** 编译器主版本 → 按年代映射到的标准（GCC 15 起才有 -std=c++26） */
-function ladderStandard(major) {
-	if (major >= 15) return "c++26";
-	if (major >= 14) return "c++23";
-	if (major >= 11) return "c++20";
-	if (major >= 5) return "c++17";
-	if (major >= 4) return "c++14";
-	return "c++11";
-}
-/**
-* 探针：这个编译器到底支不支持某个 -std= 选项。
-*
-* 不猜版本号，而是真的拿空源文件去问编译器（预处理阶段即可，不生成任何文件）。
-* 结果是「这个可执行文件 + 这个标准」粒度的，同一次会话内只问一次。
-*/
-var standardProbeCache = /* @__PURE__ */ new Map();
-function compilerSupportsStandard(executable, standard) {
-	if (!executable) return false;
-	const key = `${executable}|${standard}`;
-	const cached = standardProbeCache.get(key);
-	if (cached !== void 0) return cached;
-	let supported = false;
-	try {
-		const result = (0, node_child_process.spawnSync)(executable, [`-std=${standard}`, "-E", "-x", "c++", "-"], {
-			encoding: "utf8",
-			input: "",
-			timeout: 1e4,
-			windowsHide: true
-		});
-		const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		const failed = result.status !== 0 || result.error || /unrecognized command line option|is not valid|not supported|error:/i.test(output);
-		supported = !failed;
-	} catch {
-		supported = false;
-	}
-	standardProbeCache.set(key, supported);
-	return supported;
-}
-/**
-* 挑编译标准。
-*
-* 优先级：用户在「设置」里指定的 > 按编译器版本自动。
-* 指定的标准编译器不支持时，沿阶梯往下找第一个支持的（例如指定 C++26
-* 但机器上只有 GCC 12，就用 C++20），而不是让编译直接失败。
-*/
-function standardFlag(version, requested, executable) {
+function standardFlag(version) {
 	const major = Number.parseInt((version || "0").split(".")[0] ?? "0", 10) || 0;
-	const auto = ladderStandard(major);
-	const wanted = requested && SUPPORTED_STANDARDS.includes(requested) ? requested : auto;
-	if (!executable) return `-std=${wanted}`;
-	if (compilerSupportsStandard(executable, wanted)) return `-std=${wanted}`;
-	for (let index = SUPPORTED_STANDARDS.indexOf(wanted) - 1; index >= 0; index -= 1) {
-		if (compilerSupportsStandard(executable, SUPPORTED_STANDARDS[index])) return `-std=${SUPPORTED_STANDARDS[index]}`;
-	}
-	return `-std=${auto}`;
-}
-/**
-* 生成 CMakeLists 里的「按编译器版本挑 C++ 标准」片段，与 standardFlag 同一套阶梯。
-* 用户在「设置」里指定了标准就听用户的。
-*/
-function standardCmakeOptions(requested) {
-	const wanted = requested && SUPPORTED_STANDARDS.includes(requested) ? requested : "";
-	if (wanted) return [
-		"# 按编译器版本挑 C++ 标准。",
-		`# 这里用的是「设置」里指定的 ${wanted}。`,
-		`add_compile_options(-std=${wanted})`
-	];
-	return [
-		"# 按编译器版本挑 C++ 标准。",
-		"# GCC 15 起才支持 C++26，14 起支持 C++23，11 起支持 C++20，",
-		"# 5 起才支持 C++17；Dev-Cpp 自带的 GCC 4.9 只到 C++14，",
-		"# 硬写更高的会直接报 \"unrecognized command line option\"。",
-		"if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)",
-		"    add_compile_options(-std=c++26)",
-		"elseif(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)",
-		"    add_compile_options(-std=c++23)",
-		"elseif(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 11)",
-		"    add_compile_options(-std=c++20)",
-		"elseif(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 5)",
-		"    add_compile_options(-std=c++17)",
-		"elseif(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 4)",
-		"    add_compile_options(-std=c++14)",
-		"else()",
-		"    add_compile_options(-std=c++11)",
-		"endif()"
-	];
+	/*
+	* 按编译器大版本挑它**确实认识**的最高标准。
+	* 挑高了会直接 "unrecognized command line option -std=c++26"，
+	* 挑低了则白白浪费新编译器的能力，所以这张表要跟着 GCC 的发版节奏维护：
+	*   GCC 15/16 → C++26      GCC 14 → C++23      GCC 11~13 → C++20
+	*   GCC 5~10  → C++17      GCC 4  → C++14      更老 → C++11
+	*/
+	if (major >= 15) return "-std=c++26";
+	if (major >= 14) return "-std=c++23";
+	if (major >= 11) return "-std=c++20";
+	if (major >= 5) return "-std=c++17";
+	if (major >= 4) return "-std=c++14";
+	return "-std=c++11";
 }
 /** 编译器的输出说明它不认识我们给的 -std= 选项 */
 function standardUnsupported(output) {
@@ -3753,26 +4254,45 @@ async function compileSingleFile(root, compiler, request) {
 	const env = { ...process.env };
 	delete env.ELECTRON_RUN_AS_NODE;
 	prependPath(env, compiler.binDir);
-	const settings = await loadSettings();
-	const flags = [standardFlag(compiler.version, settings.cppStandard, compiler.executable)];
+	// 用户在「C++ 编译与链接参数」里配的额外参数（第三方库就靠这个）
+	const buildConfig = loadBuildConfig();
+	const userCflags = splitArgs(buildConfig.cflags);
+	const userLdflags = splitArgs(buildConfig.ldflags);
+	const flags = [buildConfig.cppStandard ? `-std=${buildConfig.cppStandard}` : standardFlag(compiler.version), ...userCflags];
 	if (request.debug) flags.push("-g", "-O0");
 	else flags.push(request.optimize === "none" ? "-O0" : `-${request.optimize}`);
 	if (request.staticLink) flags.push("-static");
+	// OI 相关：Windows 默认栈只有 1MB，DFS 递归十几万层就爆，
+	// 而 OJ 上（Linux）是 8MB 起步 —— 不开大栈会测出"本地 RE、线上 AC"的假象。
+	if (request.bigStack) flags.push("-Wl,--stack,268435456");
+	// 运行时检查：STL 越界断言 + 有符号溢出/除零。UBSan 不是每台 MinGW 都有，
+	// 链接失败时 oiBuild 会自动退回不带 sanitize 的版本。
+	if (request.hardening) flags.push("-D_GLIBCXX_ASSERTIONS", "-Wall", "-Wextra");
+	if (request.sanitize) flags.push("-fsanitize=undefined", "-fno-sanitize-recover=all");
 	const runCompile = (withFlags) => runCommand(compiler.executable, [
 		...withFlags,
 		absoluteSource,
 		"-o",
-		executable
+		executable,
+		// 链接库要放在源文件后面，否则 GNU ld 会找不到符号
+		...userLdflags
 	], {
 		cwd: sourceDirectory,
 		env,
 		timeoutMs: SINGLE_BUILD_TIMEOUT_MS
 	});
 	let result = await runCompile(flags);
-	if (result.code !== 0 && standardUnsupported(result.output)) {
-		const retried = await runCompile(flags.map((flag) => flag.startsWith("-std=") ? "-std=c++14" : flag));
-		if (retried.code === 0) result = retried;
-		else result = await runCompile(flags.map((flag) => flag.startsWith("-std=") ? "-std=c++11" : flag));
+	if (result.code !== 0 && standardUnsupported(result.output) && !buildConfig.cppStandard) {
+		/*
+		* 自动挑的标准被编译器拒绝了（版本号探测不准，或者是很老的 TDM-GCC）。
+		* 沿着阶梯一路往下退，直到它能接受为止 —— 一次退到底会让 GCC 16 也用 C++11，
+		* 那就等于把新编译器的能力全扔了。
+		*/
+		for (const fallback of ["c++23", "c++20", "c++17", "c++14", "c++11"]) {
+			result = await runCompile(flags.map((flag) => flag.startsWith("-std=") ? `-std=${fallback}` : flag));
+			if (result.code === 0) break;
+			if (!standardUnsupported(result.output)) break;
+		}
 	}
 	const durationMs = Date.now() - startedAt;
 	if (result.timedOut) return {
@@ -3829,7 +4349,9 @@ function runInConsole(root, compiler, executable, language, pythonExecutable) {
 	const env = { ...process.env };
 	delete env.ELECTRON_RUN_AS_NODE;
 	if (language === "cpp" && compiler) prependPath(env, compiler.binDir);
-	env.SPARKLE_RUN_CMD = language === "python" ? `"${pythonExecutable || "python"}" "${absolute}"` : `"${absolute}"`;
+	const extraRunArgs = splitArgs(loadBuildConfig().runArgs).map((arg) => /[\s"]/.test(arg) ? `"${arg}"` : arg);
+	const runSuffix = extraRunArgs.length ? ` ${extraRunArgs.join(" ")}` : "";
+	env.SPARKLE_RUN_CMD = language === "python" ? `"${pythonExecutable || "python"}" "${absolute}"${runSuffix}` : `"${absolute}"${runSuffix}`;
 	env.SPARKLE_RUN_MSG = "程序已结束，按任意键关闭窗口";
 	const batContent = [
 		"@echo off",
@@ -3886,7 +4408,7 @@ async function runExecutable(root, compiler, pythonExecutable, request) {
 	let args;
 	if (request.language === "python") {
 		command = pythonExecutable || "python";
-		args = [(0, node_path.join)(root, request.executable)];
+		args = [(0, node_path.join)(root, request.executable), ...splitArgs(loadBuildConfig().runArgs)];
 		env.PYTHONUTF8 = "1";
 		env.PYTHONIOENCODING = "utf-8";
 	} else {
@@ -3897,7 +4419,7 @@ async function runExecutable(root, compiler, pythonExecutable, request) {
 			timedOut: false
 		};
 		command = request.executable;
-		args = [];
+		args = splitArgs(loadBuildConfig().runArgs);
 		if (compiler) prependPath(env, compiler.binDir);
 	}
 	const result = await runCommand(command, args, {
@@ -3913,6 +4435,2891 @@ async function runExecutable(root, compiler, pythonExecutable, request) {
 	};
 }
 //#endregion
+//#region src/shared/settings.ts
+var DEFAULT_SETTINGS = {
+	theme: "dark",
+	editorFontSize: 14,
+	uiFontSize: 13,
+	disabledPlugins: []
+};
+// 新设置项：schema 里定义的默认值一并并进来（函数声明会被提升，这里可以调用）
+Object.assign(DEFAULT_SETTINGS, __sparkleSettingsExtras({}));
+var THEME_IDS = Object.keys({
+	dark: {
+		label: "深色（默认）",
+		description: "对齐 VS Code Dark Modern 的取色",
+		vars: {
+			"--bg": "#1f1f1f",
+			"--bg-elevated": "#181818",
+			"--bg-panel": "#202020",
+			"--border": "#2b2b2b",
+			"--status-bg": "#181818",
+			"--hover": "#2a2d2e",
+			"--active": "#37373d"
+		}
+	},
+	black: {
+		label: "纯黑",
+		description: "OLED 屏幕上更省电、对比更强",
+		vars: {
+			"--bg": "#000000",
+			"--bg-elevated": "#0a0a0a",
+			"--bg-panel": "#0d0d0d",
+			"--border": "#1f1f1f",
+			"--status-bg": "#0a0a0a",
+			"--hover": "#1a1a1a",
+			"--active": "#262626"
+		}
+	},
+	navy: {
+		label: "深蓝",
+		description: "偏冷的深蓝底，长时间看眼睛舒服一些",
+		vars: {
+			"--bg": "#0d1b2a",
+			"--bg-elevated": "#0a1622",
+			"--bg-panel": "#11202f",
+			"--border": "#1e3a52",
+			"--status-bg": "#0a1622",
+			"--hover": "#17324a",
+			"--active": "#1f4463"
+		}
+	},
+	warm: {
+		label: "暖灰",
+		description: "偏暖的深灰，像纸张的暗色调",
+		vars: {
+			"--bg": "#23201d",
+			"--bg-elevated": "#1c1a17",
+			"--bg-panel": "#272320",
+			"--border": "#3a352f",
+			"--status-bg": "#1c1a17",
+			"--hover": "#302b26",
+			"--active": "#3d372f"
+		}
+	}
+});
+var SETTINGS_CHANNELS = {
+	get: "settings:get",
+	set: "settings:set"
+};
+function clampFont(value, fallback) {
+	const n = Number(value);
+	if (!Number.isFinite(n)) return fallback;
+	return Math.min(28, Math.max(10, Math.round(n)));
+}
+/**
+* 把任何来源的设置洗成合法值。
+* 单项非法只影响该项（回退默认），不会让整份设置作废 ——
+* 用户改了字号却因为主题 id 写错导致全部重置，是很糟的体验。
+*/
+function sanitizeSettings(raw) {
+	const input = raw ?? {};
+	const theme = THEME_IDS.includes(input.theme) ? input.theme : DEFAULT_SETTINGS.theme;
+	const disabledPlugins = [];
+	if (Array.isArray(input.disabledPlugins)) for (const item of input.disabledPlugins) {
+		if (typeof item !== "string") continue;
+		const id = item.trim();
+		if (id && !disabledPlugins.includes(id) && disabledPlugins.length < 200) disabledPlugins.push(id);
+	}
+	return Object.assign({
+		theme,
+		editorFontSize: clampFont(input.editorFontSize, DEFAULT_SETTINGS.editorFontSize),
+		uiFontSize: clampFont(input.uiFontSize, DEFAULT_SETTINGS.uiFontSize),
+		disabledPlugins
+	}, __sparkleSettingsExtras(input));
+}
+//#endregion
+//#region src/main/settings.ts
+/**
+* 设置的持久化。
+*
+* 存在 userData 下的 settings.json（不是工作区里）—— 主题、字号、停用哪些插件
+* 都是"这台机器上的偏好"，跟具体项目无关。
+*
+* 读写策略：
+*   · 读失败（不存在、损坏、无权限）一律回退默认 —— 设置文件坏掉不该让 IDE 打不开
+*   · 写失败不抛给界面，只记录 —— 用户改字号时弹个错误框没有意义
+*/
+var cached = null;
+function settingsPath(userDataPath) {
+	return (0, node_path.join)(userDataPath, "settings.json");
+}
+async function loadSettings(userDataPath) {
+	if (cached) return cached;
+	try {
+		const text = await (0, node_fs_promises.readFile)(settingsPath(userDataPath), "utf8");
+		cached = sanitizeSettings(JSON.parse(text.replace(/^\uFEFF/, "")));
+	} catch {
+		cached = { ...DEFAULT_SETTINGS };
+	}
+	return cached;
+}
+/** 返回洗过之后的完整设置（调用方拿到的就是生效值） */
+async function saveSettings(userDataPath, raw) {
+	const next = sanitizeSettings(raw);
+	cached = next;
+	try {
+		const path = settingsPath(userDataPath);
+		await (0, node_fs_promises.mkdir)((0, node_path.dirname)(path), { recursive: true });
+		await (0, node_fs_promises.writeFile)(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+	} catch (error) {
+		console.log(`[settings] 写入失败（不影响本次使用）：${error instanceof Error ? error.message : String(error)}`);
+	}
+	return next;
+}
+//#endregion
+//#region src/main/build-config.ts
+/**
+* 单文件编译 / 运行的额外参数。
+*
+* 存在 userData/build-config.json —— 这里存的是自由文本（一整行命令行参数），
+* 没有枚举可校验，所以不塞进 settings.json。
+*
+* 目的：让「编译当前文件」能带上第三方库。比如 raylib（它必须在编译期链接）：
+*   额外编译参数  -I C:/raylib/raylib/src
+*   额外链接参数  -L C:/raylib/raylib/src -lraylib -lopengl32 -lgdi32 -lwinmm
+*/
+var BUILD_CONFIG_DEFAULT = {
+	cppStandard: "",
+	cflags: "",
+	ldflags: "",
+	runArgs: ""
+};
+var CPP_STANDARD_IDS = [
+	"c++11",
+	"c++14",
+	"c++17",
+	"c++20",
+	"c++23",
+	"c++26"
+];
+function buildConfigFile() {
+	return (0, node_path.join)(electron.app.getPath("userData"), "build-config.json");
+}
+function oneLineText(value, max) {
+	return typeof value === "string" ? value.replace(/[\r\n]+/g, " ").slice(0, max) : "";
+}
+function sanitizeBuildConfig(raw) {
+	const input = raw && typeof raw === "object" ? raw : {};
+	const std = typeof input.cppStandard === "string" ? input.cppStandard.trim() : "";
+	return {
+		cppStandard: CPP_STANDARD_IDS.includes(std) ? std : "",
+		cflags: oneLineText(input.cflags, 2e3),
+		ldflags: oneLineText(input.ldflags, 2e3),
+		runArgs: oneLineText(input.runArgs, 1e3)
+	};
+}
+function loadBuildConfig() {
+	try {
+		return sanitizeBuildConfig(JSON.parse(node_fs.readFileSync(buildConfigFile(), "utf8").replace(/^\uFEFF/, "")));
+	} catch {
+		return { ...BUILD_CONFIG_DEFAULT };
+	}
+}
+function saveBuildConfig(raw) {
+	const value = sanitizeBuildConfig(raw);
+	try {
+		node_fs.mkdirSync((0, node_path.dirname)(buildConfigFile()), { recursive: true });
+		node_fs.writeFileSync(buildConfigFile(), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	} catch {}
+	return value;
+}
+/**
+* 把 `-lraylib -L"C:/my lib"` 拆成 argv。
+* spawn 用的是 shell:false，所以引号和空格必须自己处理，不能直接传一整串。
+*/
+function splitArgs(text) {
+	const out = [];
+	const source = String(text || "");
+	let current = "";
+	let quote = "";
+	for (let i = 0; i < source.length; i += 1) {
+		const ch = source[i];
+		if (quote) {
+			if (ch === quote) quote = "";
+			else current += ch;
+			continue;
+		}
+		if (ch === "\"" || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (current) {
+				out.push(current);
+				current = "";
+			}
+			continue;
+		}
+		current += ch;
+	}
+	if (current) out.push(current);
+	return out;
+}
+//#endregion
+//#region src/main/ai.ts
+/**
+* AI 通道。
+*
+* 为什么请求要放在主进程：渲染层跑在 app:// 自定义源上，
+* 直接 fetch 国内各家 API 会被 CORS 挡（它们基本都不返回 Access-Control-Allow-Origin）。
+* 主进程用 Node 的 fetch 发请求，把流式增量通过 IPC 推回渲染层。
+*
+* 所有国内厂商都兼容 OpenAI 的 /chat/completions 形状，所以只写一条代码路径：
+* 服务商只是"baseUrl + 默认模型"的一组预设，想接新家直接加一条即可。
+*/
+var AI_PROVIDERS = {
+	deepseek: {
+		label: "DeepSeek",
+		baseUrl: "https://api.deepseek.com/v1",
+		model: "deepseek-chat",
+		hint: "platform.deepseek.com 申请 key"
+	},
+	qwen: {
+		label: "通义千问（DashScope 兼容模式）",
+		baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+		model: "qwen-plus",
+		hint: "bailian.console.aliyun.com 申请 key"
+	},
+	glm: {
+		label: "智谱 GLM",
+		baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+		model: "glm-4-flash",
+		hint: "bigmodel.cn 申请 key，glm-4-flash 免费"
+	},
+	kimi: {
+		label: "月之暗面 Kimi",
+		baseUrl: "https://api.moonshot.cn/v1",
+		model: "moonshot-v1-8k",
+		hint: "platform.moonshot.cn 申请 key"
+	},
+	qianfan: {
+		label: "百度千帆",
+		baseUrl: "https://qianfan.baidubce.com/v2",
+		model: "ernie-4.0-8k",
+		hint: "console.bce.baidu.com 申请 key"
+	},
+	siliconflow: {
+		label: "硅基流动 SiliconFlow",
+		baseUrl: "https://api.siliconflow.cn/v1",
+		model: "Qwen/Qwen2.5-Coder-32B-Instruct",
+		hint: "siliconflow.cn 申请 key，有免费额度"
+	},
+	ollama: {
+		label: "Ollama（本机，不用 key）",
+		baseUrl: "http://127.0.0.1:11434/v1",
+		model: "qwen2.5-coder:7b",
+		hint: "本机先 ollama serve"
+	},
+	custom: {
+		label: "自定义（OpenAI 兼容）",
+		baseUrl: "",
+		model: "",
+		hint: "填任意 OpenAI 兼容的 baseUrl，例如 https://xxx/v1"
+	}
+};
+var AI_DEFAULT = {
+	provider: "deepseek",
+	baseUrl: AI_PROVIDERS.deepseek.baseUrl,
+	apiKey: "",
+	model: AI_PROVIDERS.deepseek.model,
+	temperature: .3,
+	stream: true
+};
+var aiAborts = new Map();
+function aiConfigFile() {
+	return (0, node_path.join)(electron.app.getPath("userData"), "ai-config.json");
+}
+function sanitizeAiConfig(raw) {
+	const input = raw && typeof raw === "object" ? raw : {};
+	const provider = Object.prototype.hasOwnProperty.call(AI_PROVIDERS, input.provider) ? input.provider : AI_DEFAULT.provider;
+	const preset = AI_PROVIDERS[provider];
+	const temperature = Number(input.temperature);
+	return {
+		provider,
+		baseUrl: typeof input.baseUrl === "string" && input.baseUrl.trim() ? input.baseUrl.trim().replace(/\/+$/, "") : preset.baseUrl,
+		apiKey: typeof input.apiKey === "string" ? input.apiKey.trim().slice(0, 400) : "",
+		model: typeof input.model === "string" && input.model.trim() ? input.model.trim().slice(0, 120) : preset.model,
+		temperature: Number.isFinite(temperature) ? Math.min(2, Math.max(0, temperature)) : AI_DEFAULT.temperature,
+		stream: input.stream !== false
+	};
+}
+function loadAiConfig() {
+	try {
+		return sanitizeAiConfig(JSON.parse(node_fs.readFileSync(aiConfigFile(), "utf8").replace(/^\uFEFF/, "")));
+	} catch {
+		return { ...AI_DEFAULT };
+	}
+}
+function saveAiConfig(raw) {
+	const value = sanitizeAiConfig(raw);
+	try {
+		node_fs.mkdirSync((0, node_path.dirname)(aiConfigFile()), { recursive: true });
+		node_fs.writeFileSync(aiConfigFile(), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	} catch {}
+	return value;
+}
+/** 流式输出时，把一帧一帧的增量推给界面 */
+function aiEmitChunk(sender, payload) {
+	try {
+		if (sender && !sender.isDestroyed()) sender.send("ai:chunk", payload);
+	} catch {}
+}
+/**
+* 一次 chat/completions。
+* 支持两种模式：流式（默认，边下边显示）和一次性（有些兼容实现不支持流式 tools）。
+*/
+async function aiChat(sender, request) {
+	const cfg = loadAiConfig();
+	const baseUrl = String(request && request.baseUrl || cfg.baseUrl || "").replace(/\/+$/, "");
+	const model = String(request && request.model || cfg.model || "");
+	if (!baseUrl) return {
+		ok: false,
+		error: "还没有配置接口地址。命令面板 → AI：设置接口与模型。"
+	};
+	if (!model) return {
+		ok: false,
+		error: "还没有配置模型名。命令面板 → AI：设置接口与模型。"
+	};
+	const apiKey = String(request && request.apiKey || cfg.apiKey || "").trim();
+	const stream = request && request.stream === false ? false : cfg.stream !== false;
+	const headers = { "content-type": "application/json" };
+	if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+	const payload = {
+		model,
+		messages: Array.isArray(request?.messages) ? request.messages : [],
+		stream,
+		temperature: typeof request?.temperature === "number" ? request.temperature : cfg.temperature
+	};
+	if (Array.isArray(request?.tools) && request.tools.length > 0) {
+		payload.tools = request.tools;
+		payload.tool_choice = "auto";
+	}
+	if (typeof request?.maxTokens === "number" && request.maxTokens > 0) payload.max_tokens = Math.min(8192, request.maxTokens);
+	const id = String(request?.id || `${Date.now()}`);
+	const controller = new AbortController();
+	aiAborts.set(id, controller);
+	const timer = setTimeout(() => {
+		try {
+			controller.abort();
+		} catch {}
+	}, 18e4);
+	try {
+		const requestInit = (body) => ({
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+			signal: controller.signal
+		});
+		let response = await fetch(`${baseUrl}/chat/completions`, requestInit(payload));
+		if (response.status === 400 && payload.tools) {
+			// 有的兼容实现（部分本地模型 / 老网关）不认识 tools，退一步按纯对话再试一次
+			const plain = { ...payload };
+			delete plain.tools;
+			delete plain.tool_choice;
+			response = await fetch(`${baseUrl}/chat/completions`, requestInit(plain));
+		}
+		if (!response.ok) {
+			const text = await response.text().catch(() => "");
+			return {
+				ok: false,
+				error: `HTTP ${response.status}：${String(text).slice(0, 600) || "没有响应内容"}`
+			};
+		}
+		if (!stream) {
+			const json = await response.json();
+			const choice = json?.choices?.[0] ?? {};
+			const message = choice.message ?? {};
+			return {
+				ok: true,
+				content: typeof message.content === "string" ? message.content : "",
+				toolCalls: Array.isArray(message.tool_calls) ? message.tool_calls : [],
+				finishReason: choice.finish_reason ?? "",
+				usage: json?.usage ?? null
+			};
+		}
+		const reader = response.body.getReader();
+		const decoder = new (require("node:string_decoder").StringDecoder)("utf8");
+		let buffer = "";
+		let content = "";
+		let finishReason = "";
+		const calls = [];
+		let done = false;
+		while (!done) {
+			const { value, done: end } = await reader.read();
+			if (end) break;
+			buffer += decoder.write(Buffer.from(value));
+			let cut;
+			while ((cut = buffer.indexOf("\n\n")) >= 0) {
+				const block = buffer.slice(0, cut);
+				buffer = buffer.slice(cut + 2);
+				for (const raw of block.split("\n")) {
+					const line = raw.trim();
+					if (!line.startsWith("data:")) continue;
+					const data = line.slice(5).trim();
+					if (data === "[DONE]") {
+						done = true;
+						continue;
+					}
+					let chunk;
+					try {
+						chunk = JSON.parse(data);
+					} catch {
+						continue;
+					}
+					const choice = chunk?.choices?.[0];
+					if (!choice) continue;
+					const delta = choice.delta ?? {};
+					if (typeof delta.content === "string" && delta.content) {
+						content += delta.content;
+						aiEmitChunk(sender, { id, delta: delta.content });
+					}
+					if (Array.isArray(delta.tool_calls)) for (const item of delta.tool_calls) {
+						const index = Number.isInteger(item.index) ? item.index : 0;
+						if (!calls[index]) calls[index] = { id: "", type: "function", function: { name: "", arguments: "" } };
+						if (item.id) calls[index].id = item.id;
+						if (item.function?.name) calls[index].function.name += item.function.name;
+						if (item.function?.arguments) calls[index].function.arguments += item.function.arguments;
+					}
+					if (choice.finish_reason) finishReason = choice.finish_reason;
+				}
+			}
+		}
+		return {
+			ok: true,
+			content,
+			toolCalls: calls.filter(Boolean),
+			finishReason,
+			usage: null
+		};
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (/abort/i.test(message)) return {
+			ok: false,
+			aborted: true,
+			error: "已取消"
+		};
+		return {
+			ok: false,
+			error: `请求失败：${message}`
+		};
+	} finally {
+		clearTimeout(timer);
+		aiAborts.delete(id);
+	}
+}
+//#endregion
+//#region src/main/settings-schema.ts
+/**
+* 扩展设置项。
+*
+* 原版设置只有 theme / editorFontSize / uiFontSize / disabledPlugins，
+* 这里补上"大多数编辑器都该有"的那些开关。两端（主进程与渲染层）
+* 各留一份同样的 schema：谁负责洗值就用谁的，不跨进程传函数。
+*
+* 注意：这个函数是【函数声明】，会被提升，所以可以在 DEFAULT_SETTINGS
+* 定义之前调用（DEFAULT_SETTINGS 初始化时就要用到默认值）。
+*/
+function __sparkleSettingSpecs() {
+	return {
+		editorFontFamily: {
+			kind: "string",
+			def: "Consolas, \"Courier New\", monospace",
+			max: 200
+		},
+		editorLineHeight: {
+			kind: "number",
+			def: 1.45,
+			min: 1.1,
+			max: 2.2
+		},
+		tabSize: {
+			kind: "enum",
+			def: 4,
+			values: [2, 4, 8]
+		},
+		insertSpaces: {
+			kind: "bool",
+			def: true
+		},
+		wordWrap: {
+			kind: "enum",
+			def: "off",
+			values: ["off", "on", "bounded"]
+		},
+		wordWrapColumn: {
+			kind: "number",
+			def: 100,
+			min: 40,
+			max: 400
+		},
+		lineNumbers: {
+			kind: "enum",
+			def: "on",
+			values: ["on", "off", "relative"]
+		},
+		minimap: {
+			kind: "bool",
+			def: true
+		},
+		renderWhitespace: {
+			kind: "enum",
+			def: "none",
+			values: ["none", "boundary", "selection", "all"]
+		},
+		renderLineHighlight: {
+			kind: "enum",
+			def: "all",
+			values: ["none", "line", "gutter", "all"]
+		},
+		cursorStyle: {
+			kind: "enum",
+			def: "line",
+			values: ["line", "block", "underline"]
+		},
+		cursorBlinking: {
+			kind: "enum",
+			def: "smooth",
+			values: ["blink", "smooth", "solid"]
+		},
+		bracketPairColorization: {
+			kind: "bool",
+			def: true
+		},
+		fontLigatures: {
+			kind: "bool",
+			def: false
+		},
+		smoothScrolling: {
+			kind: "bool",
+			def: true
+		},
+		autoSave: {
+			kind: "enum",
+			def: "off",
+			values: ["off", "afterDelay", "onFocusChange"]
+		},
+		autoSaveDelay: {
+			kind: "number",
+			def: 1200,
+			min: 300,
+			max: 1e4
+		},
+		defaultLanguage: {
+			kind: "enum",
+			def: "",
+			values: ["", "cpp", "python", "javascript", "typescript", "markdown", "json", "plaintext"]
+		},
+		aiLanguage: {
+			kind: "enum",
+			def: "auto",
+			values: ["auto", "zh", "en"]
+		},
+		oiMode: {
+			kind: "bool",
+			def: false
+		}
+	};
+}
+/** 按 schema 把任意输入洗成一份合法的扩展设置 */
+function __sparkleSettingsExtras(input) {
+	const src = input && typeof input === "object" ? input : {};
+	const specs = __sparkleSettingSpecs();
+	const out = {};
+	for (const key of Object.keys(specs)) {
+		const spec = specs[key];
+		const raw = src[key];
+		let value = spec.def;
+		if (spec.kind === "bool") {
+			if (typeof raw === "boolean") value = raw;
+		} else if (spec.kind === "enum") {
+			if (spec.values.indexOf(raw) >= 0) value = raw;
+		} else if (spec.kind === "number") {
+			const n = Number(raw);
+			if (Number.isFinite(n)) value = Math.min(spec.max, Math.max(spec.min, n));
+		} else if (spec.kind === "string") {
+			if (typeof raw === "string" && raw.trim()) value = raw.trim().slice(0, spec.max);
+		}
+		out[key] = value;
+	}
+	return out;
+}
+//#endregion
+//#region src/main/oi.ts
+/**
+* OI 工作台的后端：本地测试、对拍、导题、Git。
+*
+* 几个设计原则：
+*   · 测试走 stdin 喂数据，**不需要用户写 freopen** —— 这也是大多数 OJ 的做法；
+*   · 导出题面/样例时只发一次请求，带用户自己在登录窗口里拿到的 Cookie，
+*     不碰验证码、不模拟登录（验证码交给真实网页，我们复用它的会话）；
+*   · 对拍是「生成器 + 正解 + 暴力」三个程序循环，发现差异立刻停并保留那份数据；
+*   · Git 只做最小可用集（status / init / commit / log），不实现 diff 视图。
+*/
+var OI_SEP = "\\u0000-OI-\\u0000";
+function oiNorm(text) {
+	return String(text == null ? "" : text).replace(/\r\n/g, "\n").split("\n").map((line) => line.replace(/[ \t]+$/, "")).join("\n").replace(/\n+$/, "");
+}
+function oiSame(a, b) {
+	return oiNorm(a) === oiNorm(b);
+}
+/** 跑一个可执行文件，把 stdin 喂进去 */
+/**
+* 子进程输出解码。
+*
+* 采样是 UTF-8，但 Windows 上 C++ 程序 printf("无解") 吐的是 GBK 字节 ——
+* 直接按 UTF-8 解会得到一串替换字符，样例比对必然假 WA。
+* 所以先试 UTF-8，出现替换字符再用 GBK 解一遍。
+*/
+function sparkleDecodeText(buffer) {
+	if (!buffer || buffer.length === 0) return "";
+	const utf8 = buffer.toString("utf8");
+	if (utf8.indexOf("\uFFFD") < 0) return utf8;
+	try {
+		return new TextDecoder("gbk").decode(buffer);
+	} catch {
+		return utf8;
+	}
+}
+/**
+* 内存采样。
+*
+* Windows 上拿子进程的峰值内存没有轻量 API：Node 只暴露自己的，
+* 而 PeakWorkingSet 只能在进程活着的时候读。于是按 150ms 轮询一次 tasklist，
+* 取最大值。开销小（另一个进程，不吃被测程序的 CPU），代价是"采样峰值"，
+* 可能比真实峰值低一点 —— 所以界面上标注为近似值。
+*/
+function sparkleStartMemorySampler(pid) {
+	if (process.platform !== "win32" || !pid) return null;
+	let peakKb = 0;
+	let stopped = false;
+	let timer = null;
+	const probe = () => {
+		if (stopped) return;
+		(0, node_child_process.execFile)("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+			windowsHide: true,
+			encoding: "utf8",
+			timeout: 3e3
+		}, (error, stdout) => {
+			if (error || !stdout) return;
+			const found = /"([\d,.]+)\s*K"/.exec(stdout);
+			if (!found) return;
+			const kb = parseInt(found[1].replace(/[,.]/g, ""), 10);
+			if (Number.isFinite(kb) && kb > peakKb) peakKb = kb;
+		});
+	};
+	probe();
+	timer = setInterval(probe, 150);
+	return {
+		stop() {
+			stopped = true;
+			if (timer) clearInterval(timer);
+			timer = null;
+			return peakKb;
+		}
+	};
+}
+function oiRunProgram(command, args, cwd, env, stdinText, timeoutMs) {
+	return new Promise((resolve) => {
+		// 输入走临时文件而不是管道：和 OJ 上的 freopen 行为一致，
+		// 也避免几十 MB 的输入在管道里卡住事件循环。
+		let inputFile = null;
+		let inputFd = null;
+		const cleanup = () => {
+			if (inputFd != null) {
+				try {
+					(0, node_fs.closeSync)(inputFd);
+				} catch {}
+				inputFd = null;
+			}
+			if (inputFile) {
+				try {
+					(0, node_fs.unlinkSync)(inputFile);
+				} catch {}
+				inputFile = null;
+			}
+		};
+		try {
+			if (stdinText != null && stdinText !== "") {
+				inputFile = (0, node_path.join)((0, node_os.tmpdir)(), `sparkle-oi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.in`);
+				(0, node_fs.writeFileSync)(inputFile, String(stdinText), "utf8");
+				inputFd = (0, node_fs.openSync)(inputFile, "r");
+			}
+		} catch {
+			cleanup();
+		}
+		let child;
+		try {
+			child = (0, node_child_process.spawn)(command, args, {
+				cwd,
+				env,
+				windowsHide: true,
+				shell: false,
+				stdio: [inputFd != null ? inputFd : "ignore", "pipe", "pipe"]
+			});
+		} catch (error) {
+			cleanup();
+			resolve({
+				code: null,
+				output: "",
+				stderr: String(error),
+				ms: 0,
+				timedOut: false,
+				failed: true,
+				memoryKb: 0
+			});
+			return;
+		}
+		const outChunks = [];
+		const errChunks = [];
+		let outBytes = 0;
+		let errBytes = 0;
+		let timedOut = false;
+		const startedAt = Date.now();
+		const sampler = sparkleStartMemorySampler(child.pid);
+		const timer = setTimeout(() => {
+			timedOut = true;
+			try {
+				child.kill();
+			} catch {}
+		}, Math.max(200, timeoutMs || 2e3));
+		child.stdout.on("data", (chunk) => {
+			if (outBytes >= 4e6) return;
+			outChunks.push(chunk);
+			outBytes += chunk.length;
+		});
+		child.stderr.on("data", (chunk) => {
+			if (errBytes >= 4e5) return;
+			errChunks.push(chunk);
+			errBytes += chunk.length;
+		});
+		let settled = false;
+		const finish = (code, failed) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			const memoryKb = sampler ? sampler.stop() : 0;
+			cleanup();
+			resolve({
+				code,
+				output: sparkleDecodeText(Buffer.concat(outChunks)),
+				stderr: sparkleDecodeText(Buffer.concat(errChunks)),
+				ms: Date.now() - startedAt,
+				timedOut,
+				failed,
+				memoryKb
+			});
+		};
+		child.on("error", (error) => {
+			errChunks.push(Buffer.from(String(error), "utf8"));
+			finish(null, true);
+		});
+		child.on("close", (code) => finish(code, false));
+	});
+}
+
+function oiEnvFor(compiler) {
+	const env = { ...process.env };
+	delete env.ELECTRON_RUN_AS_NODE;
+	if (compiler) prependPath(env, compiler.binDir);
+	return env;
+}
+/** 编译一个源文件，返回 {ok, executable, error, output} */
+/** 数一下编译输出里有几条 warning（用来在界面上提示"代码有味道"） */
+function oiCountWarnings(text) {
+	const found = String(text || "").match(/:\d+:\d+:\s*warning:/g);
+	return found ? found.length : 0;
+}
+async function oiBuild(root, sourcePath, compiler, options) {
+	if (/\.py$/i.test(sourcePath)) return {
+		ok: true,
+		executable: null,
+		python: true,
+		output: ""
+	};
+	const base = {
+		path: sourcePath,
+		optimize: "O2",
+		debug: false,
+		staticLink: false,
+		bigStack: true,
+		hardening: true
+	};
+	const wantSanitize = !!(options && options.sanitize);
+	let build = await compileSingleFile(root, compiler, wantSanitize ? Object.assign({}, base, { sanitize: true }) : base);
+	let sanitize = wantSanitize;
+	let note = "";
+	// UBSan 不是每台 MinGW 都带了 libubsan：链接不过时退回普通编译，
+	// 别让用户以为自己的代码有问题。GLIBCXX 断言不受影响，仍然生效。
+	if (wantSanitize && !build.ok) {
+		const retry = await compileSingleFile(root, compiler, base);
+		if (retry.ok) {
+			build = retry;
+			sanitize = false;
+			note = "\n[提示] 这台机器的 GCC 没有 UBSan 运行库，已退回普通编译（STL 越界断言仍然生效）。";
+		}
+	}
+	if (!build.ok) return {
+		ok: false,
+		error: build.friendlyError || "编译失败",
+		output: build.output || "",
+		warnings: oiCountWarnings(build.output)
+	};
+	return {
+		ok: true,
+		executable: build.executable,
+		output: (build.output || "") + note,
+		warnings: oiCountWarnings(build.output),
+		sanitize
+	};
+}
+/** 运行：Python 走解释器，C++ 走编译出来的 exe */
+function oiCommandFor(root, sourcePath, built, compiler, pythonPath) {
+	if (built && built.python) return {
+		command: pythonPath || "python",
+		args: [(0, node_path.join)(root, sourcePath)]
+	};
+	return {
+		command: built.executable,
+		args: []
+	};
+}
+/** 一键测试：编译 + 逐组喂样例 + 比对 */
+async function oiRunSamples(root, request) {
+	const compiler = currentCompiler();
+	const pythonPath = detect().find((tool) => tool.id === "python")?.path ?? "python";
+	const built = await oiBuild(root, request.path, compiler, { sanitize: !!request.sanitize });
+	if (!built.ok) return {
+		ok: false,
+		stage: "compile",
+		error: built.error,
+		output: built.output,
+		warnings: built.warnings || 0,
+		results: []
+	};
+	const cmd = oiCommandFor(root, request.path, built, compiler, pythonPath);
+	const env = oiEnvFor(compiler);
+	const cwd = (0, node_path.dirname)((0, node_path.join)(root, request.path));
+	const timeLimit = Math.min(2e4, Math.max(200, Number(request.timeLimit) || 2e3));
+	const memoryLimit = Math.max(0, Number(request.memoryLimit) || 0);
+	const results = [];
+	for (const item of request.cases || []) {
+		const run = await oiRunProgram(cmd.command, cmd.args, cwd, env, item.input, timeLimit);
+		const mle = memoryLimit > 0 && run.memoryKb > memoryLimit;
+		const pass = !run.timedOut && !mle && run.code === 0 && oiSame(run.output, item.expected);
+		results.push({
+			name: item.name || "",
+			pass,
+			ms: run.ms,
+			memoryKb: run.memoryKb,
+			mle,
+			timedOut: run.timedOut,
+			code: run.code,
+			got: String(run.output || "").slice(0, 8000),
+			expected: String(item.expected || "").slice(0, 8000),
+			stderr: String(run.stderr || "").slice(0, 4000)
+		});
+	}
+	let cleaned = null;
+	if (request.cleanup && built.executable) try {
+		(0, node_fs.unlinkSync)(built.executable);
+		cleaned = (0, node_path.basename)(built.executable);
+	} catch {}
+	return {
+		ok: true,
+		results,
+		cleaned,
+		warnings: built.warnings || 0,
+		sanitize: built.sanitize !== false,
+		timeLimit,
+		memoryLimit,
+		passed: results.filter((item) => item.pass).length,
+		total: results.length
+	};
+}
+/** 对拍：生成器 → 正解 / 暴力 → 比对，发现差异立即停 */
+async function oiStress(root, request) {
+	const compiler = currentCompiler();
+	const pythonPath = detect().find((tool) => tool.id === "python")?.path ?? "python";
+	const env = oiEnvFor(compiler);
+	const built = {};
+	for (const key of ["solution", "brute", "generator"]) {
+		const sourcePath = request[key];
+		if (!sourcePath) return {
+			ok: false,
+			error: `没有指定 ${key} 文件`
+		};
+		const one = await oiBuild(root, sourcePath, compiler);
+		if (!one.ok) return {
+			ok: false,
+			error: `${(0, node_path.basename)(sourcePath)} 编译失败：${one.error}`,
+			output: one.output
+		};
+		built[key] = Object.assign({ sourcePath }, one);
+	}
+	const cwd = (0, node_path.dirname)((0, node_path.join)(root, built.solution.sourcePath));
+	const rounds = Math.min(500, Math.max(1, Number(request.rounds) || 100));
+	const timeLimit = Math.min(1e4, Math.max(200, Number(request.timeLimit) || 2e3));
+	const deadline = Date.now() + Math.min(6e4, Math.max(5e3, Number(request.totalMs) || 2e4));
+	const runKey = async (key, stdin) => {
+		const cmd = oiCommandFor(root, built[key].sourcePath, built[key], compiler, pythonPath);
+		return oiRunProgram(cmd.command, cmd.args, cwd, env, stdin, timeLimit);
+	};
+	let done = 0;
+	for (let round = 0; round < rounds; round += 1) {
+		if (Date.now() > deadline) break;
+		const gen = await runKey("generator", "");
+		if (gen.timedOut || gen.failed) return {
+			ok: false,
+			error: "生成器运行失败",
+			stderr: gen.stderr.slice(0, 2000),
+			rounds: done
+		};
+		const input = gen.output;
+		const [fast, slow] = await Promise.all([runKey("solution", input), runKey("brute", input)]);
+		done += 1;
+		const bad = fast.timedOut || fast.code !== 0 || slow.timedOut || slow.code !== 0 || !oiSame(fast.output, slow.output);
+		if (bad) {
+			// 反例必须落盘：对拍的输入是随机生成的，报一句"第 N 组不同"
+			// 而不给数据，用户重跑一次大概率复现不出来。
+			let hackDir = null;
+			try {
+				const base = (0, node_path.join)(cwd, "hack", `hack-${Date.now()}`);
+				await (0, node_fs_promises.mkdir)(base, { recursive: true });
+				await (0, node_fs_promises.writeFile)((0, node_path.join)(base, "data.in"), input, "utf8");
+				await (0, node_fs_promises.writeFile)((0, node_path.join)(base, "sol.out"), fast.output, "utf8");
+				await (0, node_fs_promises.writeFile)((0, node_path.join)(base, "brute.out"), slow.output, "utf8");
+				await (0, node_fs_promises.writeFile)((0, node_path.join)(base, "about.txt"), [
+					`第 ${done} 组数据不一致（${new Date().toLocaleString("zh-CN")}）`,
+					`正解：${request.solution}`,
+					`暴力：${request.brute}`,
+					`生成器：${request.generator}`,
+					`正解用时 ${fast.ms}ms，暴力用时 ${slow.ms}ms`,
+					"",
+					"复现：data.in 喂给任意一版程序即可。"
+				].join("\n"), "utf8");
+				hackDir = base;
+			} catch {
+				hackDir = null;
+			}
+			return {
+			ok: true,
+			found: true,
+			rounds: done,
+			hackDir,
+			input: input.slice(0, 2e4),
+			fast: {
+				output: fast.output.slice(0, 2e4),
+				ms: fast.ms,
+				timedOut: fast.timedOut,
+				code: fast.code,
+				stderr: fast.stderr.slice(0, 2000)
+			},
+			slow: {
+				output: slow.output.slice(0, 2e4),
+				ms: slow.ms,
+				timedOut: slow.timedOut,
+				code: slow.code,
+				stderr: slow.stderr.slice(0, 2000)
+			}
+			};
+		}
+	}
+	return {
+		ok: true,
+		found: false,
+		rounds: done
+	};
+}
+
+/* ---------------- 导题 ---------------- */
+var OJ_SITES = {
+	luogu: {
+		label: "洛谷",
+		loginUrl: "https://www.luogu.com.cn/auth/login",
+		origin: "https://www.luogu.com.cn",
+		cookieUrl: "https://www.luogu.com.cn"
+	},
+	vjudge: {
+		label: "VJudge",
+		loginUrl: "https://vjudge.net/user/login",
+		origin: "https://vjudge.net",
+		cookieUrl: "https://vjudge.net"
+	}
+};
+async function oiCookieHeader(siteKey) {
+	const site = OJ_SITES[siteKey];
+	if (!site) return "";
+	try {
+		const jar = await electron.session.defaultSession.cookies.get({ url: site.cookieUrl });
+		return jar.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+	} catch {
+		return "";
+	}
+}
+async function oiSessionState(siteKey) {
+	// Cookie 只能说明"有会话"，不能说明"登录了"（三个站点未登录都会种 Cookie），
+	// 所以状态一律以页面为准。
+	return oiProbeLogin(siteKey);
+}
+/** 开一个真窗口让用户自己登录（验证码交给网页本身） */
+/**
+* 登录窗口。
+*
+* 判断"登录成功"只看**这个窗口里的 DOM 有没有 /logout 链接** —— 之前的做法是看 Cookie：
+* 洛谷的 __client_id、AtCoder 的 REVEL_SESSION、CF 的 JSESSIONID **未登录时也会种上**，
+* 于是没登录也报"已登录"。改成就地看页面，所见即所得。
+*/
+function oiOpenLogin(siteKey) {
+	const site = OJ_SITES[siteKey];
+	if (!site) return Promise.resolve({ ok: false, error: "不认识的站点" });
+	return new Promise((resolve) => {
+		const win = new electron.BrowserWindow({
+			width: 980,
+			height: 760,
+			title: `登录 ${site.label}`,
+			parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : void 0,
+			modal: false,
+			autoHideMenuBar: true,
+			webPreferences: {
+				sandbox: true,
+				contextIsolation: true,
+				nodeIntegration: false,
+				spellcheck: false
+			}
+		});
+		// Electron 默认 UA 带 Electron/xx，部分站点会直接拦；换成普通 Chrome
+		try {
+			win.webContents.setUserAgent(OI_UA);
+		} catch {}
+		let settled = false;
+		let detected = false;
+		let timer = null;
+		const lookForLogout = async () => {
+			if (win.isDestroyed()) return;
+			try {
+				const ok = await win.webContents.executeJavaScript(
+					"!!document.querySelector('a[href=\"/logout\"], a[href=\"/user/logout\"], a[href*=\"/logout\"]')",
+					true
+				);
+				if (ok && !detected) {
+					detected = true;
+					try {
+						win.close();
+					} catch {}
+				}
+			} catch {}
+		};
+		const schedule = () => {
+			clearTimeout(timer);
+			timer = setTimeout(lookForLogout, 1200);
+		};
+		win.webContents.on("did-navigate", schedule);
+		win.webContents.on("did-navigate-in-page", schedule);
+		win.webContents.on("did-finish-load", schedule);
+		win.on("closed", async () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (detected) {
+				const header = await oiCookieHeader(siteKey);
+				resolve({
+					site: siteKey,
+					loggedIn: true,
+					verified: true,
+					cookieCount: header ? header.split(";").filter(Boolean).length : 0
+				});
+				return;
+			}
+			resolve(await oiProbeLogin(siteKey));
+		});
+		win.loadURL(site.loginUrl);
+	});
+}
+
+/**
+* 真的去页面里确认登录状态（不看 Cookie）。
+* 洛谷：contest/list 的 lentille 里 user 为 null 就是没登录
+* AtCoder：/settings 未登录会跳登录页（带 password 输入框）
+* Codeforces：Cloudflare 挡着，只能开隐藏窗口看首页有没有 /logout
+*/
+async function oiProbeLogin(siteKey) {
+	const header = await oiCookieHeader(siteKey);
+	const cookieCount = header ? header.split(";").filter(Boolean).length : 0;
+	const base = {
+		site: siteKey,
+		cookieCount
+	};
+	if (siteKey === "codeforces") {
+		const page = await oiBrowserHtml("https://codeforces.com/", { waitMs: 12000 });
+		if (!page.ok) return {
+			...base,
+			loggedIn: false,
+			verified: false,
+			error: page.error
+		};
+		return {
+			...base,
+			loggedIn: /href="\/logout"/i.test(page.html),
+			verified: true
+		};
+	}
+	if (siteKey === "atcoder") {
+		let html = "";
+		let finalUrl = "";
+		try {
+			const res = await oiHttpFetch("https://atcoder.jp/settings", { accept: "text/html" });
+			html = await res.text();
+			finalUrl = String(res.url || "");
+		} catch (error) {
+			return {
+				...base,
+				loggedIn: false,
+				verified: false,
+				error: error instanceof Error ? error.message : String(error)
+			};
+		}
+		return {
+			...base,
+			loggedIn: html.length > 2000 && !/name="password"/i.test(html) && !/\/login/i.test(finalUrl),
+			verified: true
+		};
+	}
+	if (siteKey !== "luogu") {
+		// VJudge 之类没有可靠探针，只能退回 Cookie 判断，并标成"未验证"
+		return {
+			...base,
+			loggedIn: Boolean(header),
+			verified: false
+		};
+	}
+	let html = "";
+	try {
+		const res = await oiHttpFetch("https://www.luogu.com.cn/contest/list?_contentOnly=1", {
+			"x-luogu-type": "content-only",
+			accept: "application/json, text/html"
+		});
+		html = await res.text();
+	} catch (error) {
+		return {
+			...base,
+			loggedIn: false,
+			verified: false,
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+	let payload = null;
+	try {
+		payload = JSON.parse(html);
+	} catch {
+		payload = oiExtractLentille(html) || oiExtractFeInjection(html);
+	}
+	const user = payload && payload.user;
+	return {
+		...base,
+		loggedIn: Boolean(user && (user.uid || user.name)),
+		verified: true
+	};
+}
+function oiDecode(text) {
+	return String(text || "").replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, "\"").trim();
+}
+/**
+* 统一的 HTTP 出口。
+*
+* **必须用 session.fetch**：洛谷对没有 Cookie 的请求会 302 回同一个地址
+* （先种挑战 Cookie 再让你重来），Node 的 fetch 会跟随重定向但不带 Cookie，
+* 于是在原地来回跳，最后报 redirect 失败 —— 这就是"一直抓取失败"的根因。
+* session.fetch 走 Electron 自己的网络栈，自带 cookie jar，也跟着系统代理。
+*/
+var OI_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+async function oiHttpFetch(url, headers, requestInit) {
+	const init = {
+		...(requestInit || {}),
+		headers: {
+			"user-agent": OI_UA,
+			accept: "application/json, text/html;q=0.9, */*;q=0.8",
+			"accept-language": "zh-CN,zh;q=0.9",
+			...headers
+		},
+		redirect: (requestInit && requestInit.redirect) || "follow"
+	};
+	try {
+		const ses = electron.session.defaultSession;
+		if (ses && typeof ses.fetch === "function") return await ses.fetch(url, init);
+	} catch {}
+	return fetch(url, init);
+}
+/** 从 HTML 里的 window._feInjection 里抠出数据（_contentOnly 失效时的兜底） */
+function oiExtractFeInjection(html) {
+	const m = /_feInjection\s*=\s*JSON\.parse\(decodeURIComponent\("([^"]+)"\)\)/.exec(String(html || ""));
+	if (!m) return null;
+	try {
+		return JSON.parse(decodeURIComponent(m[1]));
+	} catch {
+		return null;
+	}
+}
+/** 洛谷把数据塞在 <script id="lentille-context"> 里（2026 年的结构） */
+function oiExtractLentille(html) {
+	const m = /<script[^>]*id="lentille-context"[^>]*>([\s\S]*?)<\/script>/i.exec(String(html || ""));
+	if (!m) return null;
+	try {
+		return JSON.parse(m[1]);
+	} catch {
+		return null;
+	}
+}
+/** 三种可能的形状：data.problem / currentData.problem / problem */
+function oiPickProblem(payload) {
+	if (!payload) return null;
+	if (payload.data && payload.data.problem) return payload.data.problem;
+	if (payload.currentData && payload.currentData.problem) return payload.currentData.problem;
+	if (payload.problem) return payload.problem;
+	return null;
+}
+async function oiFetchLuogu(pid) {
+	const url = `https://www.luogu.com.cn/problem/${encodeURIComponent(pid)}?_contentOnly=1`;
+	let res;
+	try {
+		res = await oiHttpFetch(url, {
+			"x-luogu-type": "content-only",
+			accept: "application/json, text/html;q=0.9"
+		});
+	} catch (error) {
+		return {
+			ok: false,
+			error: `连不上洛谷：${error instanceof Error ? error.message : String(error)}\n先点「登录 / 检查登录」，在打开的窗口里确认能打开洛谷。`
+		};
+	}
+	if (!res.ok) return {
+		ok: false,
+		error: `洛谷返回 HTTP ${res.status}。题号对不对？（例如 P1001）`
+	};
+	const finalUrl = String(res.url || url);
+	const text = await res.text();
+	let payload = null;
+	try {
+		payload = JSON.parse(text);
+	} catch {
+		payload = oiExtractLentille(text) || oiExtractFeInjection(text);
+	}
+	const problem = oiPickProblem(payload);
+	if (!problem) {
+		const needLogin = /\/auth\/login/i.test(finalUrl);
+		return {
+			ok: false,
+			error: needLogin ? "洛谷把请求转到了登录页：先点「登录 / 检查登录」登录一次，再回来抓。" : `没解析出题目数据（最终地址 ${finalUrl}，返回 ${text.length} 字符）。题号是否正确？比如 P1001。`
+		};
+	}
+	let fields = problem.contenu || problem.content || {};
+	if (typeof fields === "string") fields = { description: fields };
+	const title = problem.name || problem.title || fields.name || pid;
+	const raw = problem.samples || problem.sample || [];
+	const samples = [];
+	if (Array.isArray(raw)) for (const pair of raw) {
+		if (Array.isArray(pair) && pair.length >= 2) samples.push({
+			input: String(pair[0] == null ? "" : pair[0]),
+			output: String(pair[1] == null ? "" : pair[1])
+		});
+	}
+	const limits = problem.limits || {};
+	const timeList = Array.isArray(limits.time) ? limits.time : [];
+	const memoryList = Array.isArray(limits.memory) ? limits.memory : [];
+	const timeLimitMs = Number(timeList[0]) > 0 ? Number(timeList[0]) : 1000;
+	const memoryLimitKb = Number(memoryList[0]) > 0 ? Number(memoryList[0]) : 0;
+	return {
+		ok: true,
+		title,
+		pid: problem.pid || pid,
+		background: fields.background || "",
+		description: fields.description || "",
+		inputFormat: fields.formatI || "",
+		outputFormat: fields.formatO || "",
+		hint: fields.hint || "",
+		samples,
+		timeLimitMs,
+		memoryLimitKb,
+		difficulty: problem.difficulty || 0
+	};
+}
+async function oiFetchVjudge(pid) {
+	const url = `https://www.vjudge.net/problem/${encodeURIComponent(pid)}`;
+	let res;
+	try {
+		res = await oiHttpFetch(url, { accept: "text/html" });
+	} catch (error) {
+		return {
+			ok: false,
+			error: `连不上 VJudge：${error instanceof Error ? error.message : String(error)}`
+		};
+	}
+	if (!res.ok) return {
+		ok: false,
+		error: `VJudge 返回 HTTP ${res.status}（题号形如 Luogu-P1001）`
+	};
+	const html = await res.text();
+	const pres = [];
+	const re = /<pre[^>]*>([\s\S]*?)<\/pre>/gi;
+	let m;
+	while ((m = re.exec(html)) && pres.length < 20) pres.push(oiDecode(m[1]));
+	const samples = [];
+	for (let k = 0; k + 1 < pres.length; k += 2) samples.push({
+		input: pres[k],
+		output: pres[k + 1]
+	});
+	const titleMatch = /<h[1-3][^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/h[1-3]>/i.exec(html);
+	if (!samples.length && /login|sign in/i.test(html.slice(0, 3000))) return {
+		ok: false,
+		error: "VJudge 需要登录才能看这题：先点「登录 / 检查登录」。"
+	};
+	return {
+		ok: true,
+		title: titleMatch ? oiDecode(titleMatch[1]) : pid,
+		pid,
+		content: "",
+		description: "",
+		samples
+	};
+}
+async function oiFetchProblem(siteKey, pid) {
+	try {
+		if (siteKey === "vjudge") return await oiFetchVjudge(pid);
+		if (siteKey === "codeforces") return await oiFetchCodeforces(pid);
+		if (siteKey === "atcoder") return await oiFetchAtCoder(pid);
+		return await oiFetchLuogu(pid);
+	} catch (error) {
+		return {
+			ok: false,
+			error: `抓取失败：${error instanceof Error ? error.message : String(error)}`
+		};
+	}
+}
+/** 把题目落成工作区文件：{dir}/{pid}.cpp + 1.in/1.out ... */
+async function oiImportProblem(root, siteKey, pid, problem, dirOverride) {
+	const safe = String(problem.pid || pid).replace(/[^A-Za-z0-9_.-]/g, "_");
+	// 整场比赛导入时用「比赛ID/题号」两层目录；单题导入还是题号当目录
+	const dirRelative = String(dirOverride || safe).replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+	const dirAbsolute = (0, node_path.join)(root, dirRelative);
+	await (0, node_fs_promises.mkdir)(dirAbsolute, { recursive: true });
+	const lines = [`# ${problem.title || safe}`, `来源：${OJ_SITES[siteKey] ? OJ_SITES[siteKey].label : siteKey} / ${problem.pid || pid}`];
+	if (problem.timeLimitMs) lines.push(`时间限制：${problem.timeLimitMs} ms　内存限制：${problem.memoryLimitKb ? Math.round(problem.memoryLimitKb / 1024) + " MB" : "未提供"}`);
+	lines.push("");
+	for (const block of [problem.background, problem.description, problem.inputFormat && `### 输入格式\n${problem.inputFormat}`, problem.outputFormat && `### 输出格式\n${problem.outputFormat}`, problem.hint && `### 提示\n${problem.hint}`, problem.content]) {
+		if (block) lines.push(String(block), "");
+	}
+	await (0, node_fs_promises.writeFile)((0, node_path.join)(dirAbsolute, "题目.md"), lines.join("\n"), "utf8");
+	const samples = problem.samples || [];
+	for (let i = 0; i < samples.length; i += 1) {
+		await (0, node_fs_promises.writeFile)((0, node_path.join)(dirAbsolute, `${i + 1}.in`), samples[i].input, "utf8");
+		await (0, node_fs_promises.writeFile)((0, node_path.join)(dirAbsolute, `${i + 1}.out`), samples[i].output, "utf8");
+	}
+	const codePath = (0, node_path.join)(dirAbsolute, `${safe}.cpp`);
+	if (!(0, node_fs.existsSync)(codePath)) await (0, node_fs_promises.writeFile)(codePath, "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n\tios::sync_with_stdio(false);\n\tcin.tie(nullptr);\n\t\n\treturn 0;\n}\n", "utf8");
+	return {
+		ok: true,
+		dir: dirRelative,
+		code: `${dirRelative}/${safe}.cpp`,
+		samples: samples.length,
+		title: problem.title || safe,
+		timeLimitMs: problem.timeLimitMs || 1000
+	};
+}
+
+/* ================= OJ：在线提交 / 比赛 ================= */
+
+// 新增两个站点（登录窗口、Cookie 读取都复用原来那套）
+OJ_SITES.codeforces = {
+	label: "Codeforces",
+	loginUrl: "https://codeforces.com/enter",
+	origin: "https://codeforces.com",
+	cookieUrl: "https://codeforces.com"
+};
+OJ_SITES.atcoder = {
+	label: "AtCoder",
+	loginUrl: "https://atcoder.jp/login",
+	origin: "https://atcoder.jp",
+	cookieUrl: "https://atcoder.jp"
+};
+
+var OJ_LANGS = {
+	luogu: [
+		{ id: "5", label: "C++（洛谷默认）" },
+		{ id: "11", label: "C++14" },
+		{ id: "12", label: "C++17" },
+		{ id: "27", label: "C++20" }
+	],
+	codeforces: [{ id: "auto", label: "自动（GNU G++）" }],
+	atcoder: [{ id: "auto", label: "自动（最新 C++）" }]
+};
+
+var OJ_LUOGU_STATUS = {
+	0: "等待评测",
+	1: "评测中",
+	2: "编译错误",
+	3: "输出超限",
+	4: "内存超限",
+	5: "超时",
+	6: "答案错误",
+	7: "运行时错误",
+	8: "未知错误",
+	12: "通过",
+	13: "不计分",
+	14: "未通过",
+	21: "Hack"
+};
+
+/** 把进度推给渲染层（导题、提交都能用） */
+function oiEmitProgress(payload) {
+	try {
+		if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("oi:progress", payload || {});
+	} catch {}
+}
+
+async function oiCheckLogin(siteKey) {
+	// 保留这个名字给 IPC 用，实现统一走页面探测
+	return oiProbeLogin(siteKey);
+}
+
+/** 去掉标签、解码实体；不 trim，保留代码块里的空白 */
+function oiStripTags(text) {
+	return String(text || "").replace(/<[^>]+>/g, "");
+}
+function oiDecodeEntities(text) {
+	return String(text || "").replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&copy;/g, "(c)").replace(/&amp;/g, "&");
+}
+
+/**
+* 题面 HTML → Markdown。
+* 只处理「题面里真会出现的」那几种标签，目标是让 题目.md 在 Markdown 预览里排得出来，
+* 不追求完整还原（表格、图片只保留文字）。
+*/
+function oiHtmlToMarkdown(html) {
+	let s = String(html || "").replace(/\r\n?/g, "\n");
+	s = s.replace(/<(script|style)[\s\S]*?<\/\1>/gi, "");
+	s = s.replace(/<div class="section-title">([\s\S]*?)<\/div>/gi, (m, body) => "\n### " + oiStripTags(body).trim() + "\n");
+	s = s.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (m, body) => "\n```\n" + oiStripTags(body).replace(/^\n+|\n+$/g, "") + "\n```\n");
+	s = s.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (m, level, body) => "\n" + "#".repeat(Math.max(1, Math.min(6, Number(level)))) + " " + oiStripTags(body).replace(/\s+/g, " ").trim() + "\n");
+	s = s.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (m, body) => "\n- " + oiStripTags(body).replace(/\s+/g, " ").trim());
+	s = s.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, (m, tag, body) => "**" + oiStripTags(body).trim() + "**");
+	s = s.replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, (m, tag, body) => "*" + oiStripTags(body).trim() + "*");
+	s = s.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (m, body) => "`" + oiStripTags(body).trim() + "`");
+	s = s.replace(/<var[^>]*>([\s\S]*?)<\/var>/gi, (m, body) => "`" + oiStripTags(body).trim() + "`");
+	s = s.replace(/<br\s*\/?>/gi, "\n");
+	s = s.replace(/<\/(p|div|section|blockquote|tr|table|ul|ol)>/gi, "\n\n");
+	s = s.replace(/<[^>]+>/g, "");
+	s = oiDecodeEntities(s);
+	s = s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+	return s.trim();
+}
+
+/**
+* 用隐藏窗口抓页面。
+* Codeforces 前面挂着 Cloudflare，session.fetch 会拿到 "Just a moment..."，
+* 只有真 Chromium 跑完 JS 挑战才能过 —— 所以这里开一个 show:false 的窗口，
+* 等挑战自己过完再把 DOM 取出来。
+*/
+function oiBrowserHtml(url, options) {
+	const opts = options || {};
+	return new Promise((resolve) => {
+		let win;
+		try {
+			win = new electron.BrowserWindow({
+				show: false,
+				width: 1280,
+				height: 900,
+				webPreferences: {
+					sandbox: true,
+					contextIsolation: true,
+					nodeIntegration: false,
+					spellcheck: false,
+					backgroundThrottling: false,
+					images: false
+				}
+			});
+		} catch (error) {
+			resolve({ ok: false, error: error instanceof Error ? error.message : String(error) });
+			return;
+		}
+		let settled = false;
+		const finish = (result) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(deadline);
+			try {
+				win.destroy();
+			} catch {}
+			resolve(result);
+		};
+		const deadline = setTimeout(() => finish({ ok: false, error: "页面加载超时" }), opts.timeout || 45000);
+		try {
+			win.webContents.setUserAgent(OI_UA);
+		} catch {}
+		win.webContents.on("did-fail-load", (_event, _code, desc) => finish({ ok: false, error: "加载失败：" + desc }));
+		win.webContents.on("did-finish-load", () => {
+			const startedAt = Date.now();
+			const budget = opts.waitMs || 15000;
+			const read = async () => {
+				if (settled) return;
+				let html = "";
+				try {
+					html = String(await win.webContents.executeJavaScript("document.documentElement.outerHTML", true) || "");
+				} catch {}
+				const head = html.slice(0, 6000);
+				const challenged = /Just a moment|cf-challenge|Checking your browser|Attention Required|Enable JavaScript and cookies/i.test(head) || html.length < 1200;
+				if (!challenged || Date.now() - startedAt > budget) {
+					finish({ ok: true, html, url: win.webContents.getURL() });
+					return;
+				}
+				setTimeout(read, 1200);
+			};
+			setTimeout(read, 900);
+		});
+		try {
+			win.loadURL(url);
+		} catch (error) {
+			finish({ ok: false, error: error instanceof Error ? error.message : String(error) });
+		}
+	});
+}
+
+function oiParseCfPid(raw) {
+	const text = String(raw || "").trim().toUpperCase().replace(/[\s/_\-]/g, "");
+	if (!text) return null;
+	const m = /^([0-9]{1,6})([A-Z][0-9]{0,2})$/.exec(text);
+	if (!m) return null;
+	return { contestId: Number(m[1]), index: m[2] };
+}
+
+/* ---------------- 抓题：Codeforces / AtCoder ---------------- */
+
+async function oiFetchCodeforces(pid) {
+	const info = oiParseCfPid(pid);
+	if (!info) return { ok: false, error: "Codeforces 题号写成 4A 或 2282A 这种形式" };
+	const url = "https://codeforces.com/contest/" + info.contestId + "/problem/" + info.index;
+	const page = await oiBrowserHtml(url, { waitMs: 20000 });
+	if (!page.ok) return { ok: false, error: "打不开 Codeforces：" + page.error };
+	const html = page.html;
+	if (/Just a moment|cf-challenge|Checking your browser/i.test(html.slice(0, 8000))) return {
+		ok: false,
+		error: "Codeforces 的人机验证没通过：先点「登录 / 检查登录」，在打开的窗口里手动过一次验证，再回来导入。"
+	};
+	const titleMatch = /<div class="title">\s*([A-Za-z0-9]+)\s*\.\s*([\s\S]*?)<\/div>/.exec(html);
+	const title = titleMatch ? oiDecodeEntities(oiStripTags(titleMatch[2])).trim() : info.contestId + info.index;
+	const startAt = html.indexOf("<div class=\"problem-statement\">");
+	const sampleAt = html.indexOf("<div class=\"sample-test\">");
+	let stmt = startAt >= 0 ? html.slice(startAt, sampleAt > startAt ? sampleAt : void 0) : "";
+	stmt = stmt.replace(/<div class="title">[\s\S]*?<\/div>/i, "").replace(/<div class="(time-limit|memory-limit|input-file|output-file)">[\s\S]*?<\/div>/gi, "");
+	const samples = [];
+	const sampleRe = /<div class="(input|output)">[\s\S]*?<pre[^>]*>([\s\S]*?)<\/pre>/gi;
+	let match;
+	while ((match = sampleRe.exec(html))) {
+		const text = oiDecodeEntities(oiStripTags(match[2]));
+		if (match[1] === "input") samples.push({ input: text + "\n", output: "" });
+		else if (samples.length) samples[samples.length - 1].output = text + "\n";
+	}
+	const timeMatch = /time limit per test:\s*([\d.]+)\s*seconds?/i.exec(html);
+	const memMatch = /memory limit per test:\s*([\d.]+)\s*megabytes?/i.exec(html);
+	return {
+		ok: true,
+		title,
+		pid: info.contestId + info.index,
+		content: oiHtmlToMarkdown(stmt),
+		description: "",
+		samples,
+		timeLimitMs: timeMatch ? Math.round(Number(timeMatch[1]) * 1000) : 2000,
+		memoryLimitKb: memMatch ? Math.round(Number(memMatch[1]) * 1024) : 0
+	};
+}
+
+async function oiFetchAtCoder(pid) {
+	const taskId = String(pid || "").trim();
+	const contestId = taskId.indexOf("_") >= 0 ? taskId.slice(0, taskId.lastIndexOf("_")) : "";
+	if (!contestId) return { ok: false, error: "AtCoder 题号写成 abc400_a 这种形式" };
+	const url = "https://atcoder.jp/contests/" + contestId + "/tasks/" + taskId + "?lang=en";
+	let res;
+	try {
+		res = await oiHttpFetch(url, { accept: "text/html" });
+	} catch (error) {
+		return { ok: false, error: "连不上 AtCoder：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	if (!res.ok) return { ok: false, error: "AtCoder 返回 HTTP " + res.status };
+	const html = await res.text();
+	const titleMatch = /<title>([^<]*)<\/title>/.exec(html);
+	let title = titleMatch ? oiDecodeEntities(titleMatch[1]).trim() : taskId;
+	title = title.replace(/\s*-\s*AtCoder\s*$/i, "").replace(/^[A-Z]+\s*-\s*/, "").trim();
+	const enStart = html.indexOf("<span class=\"lang-en\">");
+	const jaStart = html.indexOf("<span class=\"lang-ja\">");
+	let body = enStart >= 0 ? html.slice(enStart) : html;
+	// 题面只在 <div id="task-statement"> 里；两个语种块谁先谁后不固定，
+	// 所以先看另一种语言块是不是在后面，否则退到分享按钮 / 页脚之前。
+	let bodyEnd = -1;
+	if (jaStart > enStart) bodyEnd = jaStart;
+	else {
+		const stops = [html.indexOf("<div class=\"a2a_kit", enStart), html.indexOf("<footer", enStart)].filter((at) => at > 0);
+		if (stops.length) bodyEnd = Math.min.apply(null, stops);
+	}
+	if (bodyEnd > 0) body = html.slice(enStart, bodyEnd);
+	const inputs = {};
+	const outputs = {};
+	const sampleRe = /<h3>\s*Sample (Input|Output)\s*([0-9]+)\s*<\/h3>\s*<pre[^>]*>([\s\S]*?)<\/pre>/gi;
+	let match;
+	while ((match = sampleRe.exec(body))) {
+		const text = oiDecodeEntities(oiStripTags(match[3])).replace(/\r/g, "");
+		const index = Number(match[2]);
+		if (/input/i.test(match[1])) inputs[index] = text;
+		else outputs[index] = text;
+	}
+	const samples = [];
+	Object.keys(inputs).map(Number).sort((a, b) => a - b).forEach((index) => {
+		if (outputs[index] == null) return;
+		samples.push({ input: inputs[index] + "\n", output: outputs[index] + "\n" });
+	});
+	const statementHtml = body.replace(/<h3>\s*Sample (Input|Output)[\s\S]*?<\/section>/gi, "");
+	const timeMatch = /Time Limit:\s*([\d.]+)\s*sec/i.exec(html);
+	const memMatch = /Memory Limit:\s*([0-9]+)\s*(MiB|MB|GB)/i.exec(html);
+	const memKb = memMatch ? ((/(GB)/i.test(memMatch[2]) ? Number(memMatch[1]) * 1024 * 1024 : Number(memMatch[1]))) : 0;
+	return {
+		ok: true,
+		title,
+		pid: taskId,
+		content: oiHtmlToMarkdown(statementHtml),
+		description: "",
+		samples,
+		timeLimitMs: timeMatch ? Math.round(Number(timeMatch[1]) * 1000) : 2000,
+		memoryLimitKb: memKb
+	};
+}
+
+/* ---------------- 提交 ---------------- */
+
+/**
+* 降级提交：把代码放进剪贴板，打开网页让用户自己粘贴 + 过验证码。
+* 洛谷的风控（滑块/验证码）在接口层是过不去的，只能回到网页。
+*/
+function oiFallbackWindow(siteKey, pid, code, reason) {
+	const site = OJ_SITES[siteKey];
+	if (!site) return { ok: false, error: "不认识的站点" };
+	try {
+		electron.clipboard.writeText(String(code || ""));
+	} catch {}
+	const url = siteKey === "luogu" ? "https://www.luogu.com.cn/problem/" + encodeURIComponent(pid) : site.origin;
+	try {
+		const win = new electron.BrowserWindow({
+			width: 1100,
+			height: 860,
+			title: "在网页里提交 · 代码已复制到剪贴板",
+			parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : void 0,
+			autoHideMenuBar: true,
+			webPreferences: {
+				sandbox: true,
+				contextIsolation: true,
+				nodeIntegration: false,
+				spellcheck: false
+			}
+		});
+		win.webContents.setUserAgent(OI_UA);
+		win.loadURL(url);
+	} catch (error) {
+		return { ok: false, error: (reason ? reason + "；" : "") + "打开网页也失败了：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	return {
+		ok: true,
+		site: siteKey,
+		window: true,
+		fallback: true,
+		copied: true,
+		message: "已把代码复制到剪贴板，并打开 " + site.label + " 的题目页：粘贴后自己点提交（验证码在网页里输）。" + (reason ? "\n原因：" + reason : "")
+	};
+}
+
+async function oiSubmit(/* payload */ payload) {
+	const site = String(payload && payload.site || "luogu");
+	if (site === "luogu") return oiSubmitLuogu(payload);
+	if (site === "atcoder") return oiSubmitAtCoder(payload);
+	if (site === "codeforces") return oiSubmitCodeforcesWindow(payload);
+	return { ok: false, error: "不认识的站点" };
+}
+
+async function oiSubmitLuogu(payload) {
+	const pid = String(payload && payload.pid || "").trim();
+	const code = String(payload && payload.code || "");
+	if (!pid) return { ok: false, error: "先填题号" };
+	if (!code.trim()) return { ok: false, error: "当前文件是空的，没东西可交" };
+	let pageRes;
+	try {
+		pageRes = await oiHttpFetch("https://www.luogu.com.cn/problem/" + encodeURIComponent(pid), { accept: "text/html" });
+	} catch (error) {
+		return { ok: false, error: "连不上洛谷：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const html = await pageRes.text();
+	if (/\/auth\/login/i.test(String(pageRes.url || "")) || /id="login-form"/.test(html)) return {
+		ok: false,
+		error: "洛谷还没登录：点「登录 / 检查登录」，在窗口里登录后再提交。"
+	};
+	const csrfMatch = /<meta name="csrf-token" content="([^"]+)"/.exec(html);
+	const csrf = csrfMatch ? csrfMatch[1] : "";
+	const lang = Number(payload && payload.lang) || 5;
+	let res;
+	try {
+		res = await oiHttpFetch("https://www.luogu.com.cn/fe/api/problem/submit/" + encodeURIComponent(pid), {
+			"content-type": "application/json",
+			"x-csrf-token": csrf,
+			"x-requested-with": "XMLHttpRequest",
+			referer: "https://www.luogu.com.cn/problem/" + pid,
+			origin: "https://www.luogu.com.cn",
+			accept: "application/json"
+		}, { method: "POST", body: JSON.stringify({ code, lang, enableO2: true }) });
+	} catch (error) {
+		return { ok: false, error: "提交请求失败：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const text = await res.text();
+	let data = null;
+	try {
+		data = JSON.parse(text);
+	} catch {}
+	if (!data) return oiFallbackWindow("luogu", pid, code, "洛谷返回的不是 JSON（HTTP " + res.status + "），多半是登录失效或被风控拦了");
+	if (data.errorCode || data.errorType) {
+		const message = String(data.errorMessage || data.errorType || "");
+		if (/Unlogin|未登录|尚未登录|not\s*logged/i.test(message)) return oiFallbackWindow("luogu", pid, code, "登录已失效");
+		return oiFallbackWindow("luogu", pid, code, message);
+	}
+	const rid = data.rid || data.currentData && data.currentData.rid || data.data && data.data.rid;
+	if (!rid) return { ok: false, error: "提交返回里没有记录号：" + text.slice(0, 160) };
+	return { ok: true, site: "luogu", rid: String(rid), pid };
+}
+
+async function oiLuoguSubmission(rid) {
+	if (!rid) return { ok: false, error: "缺少记录号" };
+	const url = "https://www.luogu.com.cn/record/" + encodeURIComponent(rid) + "?_contentOnly=1";
+	let res;
+	try {
+		res = await oiHttpFetch(url, { "x-luogu-type": "content-only", accept: "application/json, text/html" });
+	} catch (error) {
+		return { ok: false, error: "读取评测结果失败：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const text = await res.text();
+	let payload = null;
+	try {
+		payload = JSON.parse(text);
+	} catch {
+		payload = oiExtractLentille(text) || oiExtractFeInjection(text);
+	}
+	const data = payload && (payload.currentData || payload.data) || {};
+	const record = data.record || data.records && data.records.result && data.records.result[0];
+	if (!record) return { ok: false, error: "读不到这条记录（可能登录失效了）" };
+	const status = Number(record.status);
+	const statusText = OJ_LUOGU_STATUS[status] || "状态 " + status;
+	const accepted = status === 12;
+	const done = status !== 0 && status !== 1;
+	const compile = record.detail && record.detail.compileResult;
+	const message = compile && !compile.success ? String(compile.stderr || compile.message || "").slice(0, 1200) : "";
+	return {
+		ok: true,
+		done,
+		accepted,
+		status,
+		statusText,
+		score: record.score == null ? null : record.score,
+		time: record.time == null ? null : record.time,
+		memory: record.memory == null ? null : record.memory,
+		compileError: message,
+		url: "https://www.luogu.com.cn/record/" + rid
+	};
+}
+
+async function oiSubmitAtCoder(payload) {
+	const taskId = String(payload && payload.pid || "").trim();
+	const code = String(payload && payload.code || "");
+	if (!taskId || taskId.indexOf("_") < 0) return { ok: false, error: "AtCoder 题号写成 abc400_a 这种形式" };
+	if (!code.trim()) return { ok: false, error: "当前文件是空的，没东西可交" };
+	const contestId = taskId.slice(0, taskId.lastIndexOf("_"));
+	const submitUrl = "https://atcoder.jp/contests/" + contestId + "/submit?taskScreenName=" + encodeURIComponent(taskId);
+	let page;
+	try {
+		page = await oiHttpFetch(submitUrl, { accept: "text/html" });
+	} catch (error) {
+		return { ok: false, error: "连不上 AtCoder：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const html = await page.text();
+	if (/\/login/i.test(String(page.url || ""))) return { ok: false, error: "AtCoder 还没登录：点「登录 / 检查登录」登录后再提交。" };
+	const csrfMatch = /name="csrf_token"\s+value="([^"]+)"/.exec(html);
+	if (!csrfMatch) return {
+		ok: false,
+		error: /sign in|log in|ログイン|ログインしてください/i.test(html)
+			? "AtCoder 还没登录：点「登录 / 检查登录」登录后再提交。"
+			: "没拿到 AtCoder 的 csrf_token（比赛可能已经结束，或者页面结构变了）"
+	};
+	const selectMatch = /<select[^>]*name="data\.LanguageId"[^>]*>([\s\S]*?)<\/select>/.exec(html);
+	const languages = [];
+	if (selectMatch) {
+		const optionRe = /<option[^>]*value="([0-9]+)"[^>]*>([^<]+)<\/option>/gi;
+		let option;
+		while ((option = optionRe.exec(selectMatch[1]))) languages.push({ id: option[1], label: oiDecodeEntities(option[2]).trim() });
+	}
+	let langId = String(payload && payload.lang || "").trim();
+	if (!/^[0-9]+$/.test(langId)) {
+		const cpp = languages.filter((item) => /C\+\+/.test(item.label));
+		const modern = cpp.filter((item) => /C\+\+\s*2[0-9]|GCC\s*1[2-9]/.test(item.label));
+		langId = (modern[0] || cpp[0] || {}).id || "";
+	}
+	if (!langId) return { ok: false, error: "没在提交页里找到 C++ 语言选项" };
+	const body = new URLSearchParams({
+		csrf_token: csrfMatch[1],
+		"data.TaskScreenName": taskId,
+		"data.LanguageId": langId,
+		sourceCode: code
+	}).toString();
+	let res;
+	try {
+		res = await oiHttpFetch(submitUrl, {
+			"content-type": "application/x-www-form-urlencoded",
+			referer: submitUrl,
+			origin: "https://atcoder.jp",
+			accept: "text/html"
+		}, { method: "POST", body });
+	} catch (error) {
+		return { ok: false, error: "提交请求失败：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const finalUrl = String(res.url || "");
+	const resHtml = await res.text();
+	if (/\/submit(\?|$)/.test(finalUrl)) {
+		const alertMatch = /<div class="alert alert-danger">([\s\S]*?)<\/div>/.exec(resHtml);
+		return { ok: false, error: alertMatch ? oiDecodeEntities(oiStripTags(alertMatch[1])).trim() : "AtCoder 没有接受这次提交（未登录 / 比赛已结束 / 语言不对）" };
+	}
+	let sid = null;
+	try {
+		const meRes = await oiHttpFetch("https://atcoder.jp/contests/" + contestId + "/submissions/me", { accept: "text/html" });
+		const meHtml = await meRes.text();
+		const idMatch = new RegExp("/contests/" + contestId + "/submissions/([0-9]+)").exec(meHtml);
+		if (idMatch) sid = idMatch[1];
+	} catch {}
+	return { ok: true, site: "atcoder", sid, contestId, taskId, langId };
+}
+
+async function oiAtCoderSubmission(contestId, sid) {
+	if (!contestId || !sid) return { ok: false, error: "缺少提交记录号" };
+	const url = "https://atcoder.jp/contests/" + contestId + "/submissions/" + sid;
+	let res;
+	try {
+		res = await oiHttpFetch(url, { accept: "text/html" });
+	} catch (error) {
+		return { ok: false, error: "读取评测结果失败：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const html = await res.text();
+	const statusMatch = /<td[^>]*id="judge-status"[^>]*>([\s\S]*?)<\/td>/.exec(html);
+	const labelMatch = /<span class="label[^"]*">([^<]+)<\/span>/.exec(statusMatch ? statusMatch[1] : "");
+	const raw = labelMatch ? oiDecodeEntities(labelMatch[1]).trim() : (statusMatch ? oiDecodeEntities(oiStripTags(statusMatch[1])).trim() : "");
+	const statusText = raw || "等待评测";
+	const pending = !raw || /WJ|Judging|Waiting|Queued/i.test(raw);
+	const accepted = raw === "AC";
+	const scoreMatch = /<td[^>]*id="judge-status"[^>]*>[\s\S]*?<\/td>\s*<td[^>]*class="text-right"[^>]*>([^<]*)<\/td>/.exec(html);
+	return {
+		ok: true,
+		done: !pending,
+		accepted,
+		statusText,
+		score: scoreMatch ? Number(scoreMatch[1]) || 0 : null,
+		url
+	};
+}
+
+/* ---- Codeforces：开窗口填代码，人机验证由用户点 ---- */
+
+var oiCfWindow = null;
+var oiCfTimers = [];
+
+function oiCfStopTimers() {
+	oiCfTimers.forEach((timer) => clearTimeout(timer));
+	oiCfTimers = [];
+}
+
+function oiSubmitCodeforcesWindow(payload) {
+	const info = oiParseCfPid(payload && payload.pid);
+	if (!info) return { ok: false, error: "Codeforces 题号写成 4A 或 2282A 这种形式" };
+	const code = String(payload && payload.code || "");
+	if (!code.trim()) return { ok: false, error: "当前文件是空的，没东西可交" };
+	const pidValue = String(info.index);
+	const submitUrl = "https://codeforces.com/contest/" + info.contestId + "/submit";
+	oiCfStopTimers();
+	try {
+		if (oiCfWindow && !oiCfWindow.isDestroyed()) oiCfWindow.close();
+	} catch {}
+	const win = new electron.BrowserWindow({
+		width: 1000,
+		height: 820,
+		title: "Codeforces 提交 · 确认无误后点 Submit",
+		parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : void 0,
+		autoHideMenuBar: true,
+		webPreferences: {
+			sandbox: true,
+			contextIsolation: true,
+			nodeIntegration: false,
+			spellcheck: false
+		}
+	});
+	oiCfWindow = win;
+	try {
+		win.webContents.setUserAgent(OI_UA);
+	} catch {}
+
+	const fillScript = "(function(){" +
+		"var code=" + JSON.stringify(code) + ";" +
+		"var pid=" + JSON.stringify(pidValue) + ";" +
+		"var ta=document.querySelector('textarea[name=\"source\"], textarea#source');" +
+		"if(ta){ta.focus();ta.value=code;ta.dispatchEvent(new Event('input',{bubbles:true}));}" +
+		"var pc=document.querySelector('input[name=\"submittedProblemCode\"], select[name=\"submittedProblemCode\"]');" +
+		"if(pc){pc.value=pid;pc.dispatchEvent(new Event('input',{bubbles:true}));pc.dispatchEvent(new Event('change',{bubbles:true}));}" +
+		"var sel=document.querySelector('select[name=\"programTypeId\"]');" +
+		"var picked='';" +
+		"if(sel){var opts=Array.prototype.slice.call(sel.options);" +
+		"var num=function(o){var m=o.textContent.match(/[0-9]+/);return m?parseInt(m[0],10):0};" +
+		"var cpp=opts.filter(function(o){return /GNU G[+][+]/.test(o.textContent)});" +
+		"cpp.sort(function(a,b){return num(b)-num(a)});" +
+		"if(cpp[0]){sel.value=cpp[0].value;sel.dispatchEvent(new Event('change',{bubbles:true}));picked=cpp[0].textContent.trim();}}" +
+		"return {filled:!!(ta&&pc),pid:pc?pc.value:'',language:picked};" +
+		"})()";
+
+	const probeScript = "(function(){" +
+		"var a=document.querySelector('a[href*=\"/submission/\"]');" +
+		"var ok=document.querySelector('.alert-success');" +
+		"return {href:a?a.getAttribute('href'):'',alert:ok?ok.textContent.trim():''};" +
+		"})()";
+
+	const state = { filled: false, polledUrl: "", done: false, warned: false };
+
+	const schedule = (fn, delay) => {
+		oiCfTimers.push(setTimeout(fn, delay));
+	};
+
+	const readVerdict = (url) => {
+		if (win.isDestroyed() || state.done) return;
+		win.webContents.executeJavaScript("(function(){var el=document.querySelector('span.verdict-accepted,span.verdict-rejected,span[class*=\"verdict\"]');return el?el.textContent.trim():''})()", true).then((verdict) => {
+			if (win.isDestroyed() || state.done) return;
+			const text = String(verdict || "").trim();
+			if (!text || /TESTING|Running on test|Waiting|In queue|Pending/i.test(text)) {
+				oiEmitProgress({ stage: "cf-judging", url, message: "已提交，正在评测…" });
+				schedule(() => {
+					if (!win.isDestroyed()) win.webContents.reload();
+				}, 2500);
+				schedule(() => readVerdict(url), 4000);
+				return;
+			}
+			state.done = true;
+			oiEmitProgress({
+				stage: "cf-done",
+				verdict: text,
+				accepted: /Accepted|Pretests passed/i.test(text),
+				url,
+				message: "评测完成：" + text
+			});
+		}).catch(() => {});
+	};
+
+	const tick = () => {
+		if (win.isDestroyed() || state.done) return;
+		const href = win.webContents.getURL();
+		if (/\/submission\//.test(href)) {
+			if (state.polledUrl !== href) {
+				state.polledUrl = href;
+				readVerdict(href);
+			}
+			schedule(tick, 2000);
+			return;
+		}
+		if (!/\/submit/.test(href)) {
+			schedule(tick, 1500);
+			return;
+		}
+		win.webContents.executeJavaScript(probeScript, true).then((probe) => {
+			if (win.isDestroyed() || state.done) return;
+			if (probe && probe.href) {
+				state.polledUrl = "";
+				oiEmitProgress({ stage: "cf-submitted", url: probe.href, message: "已提交：" + probe.href });
+				try {
+					win.loadURL(probe.href.indexOf("http") === 0 ? probe.href : "https://codeforces.com" + probe.href);
+				} catch {}
+				schedule(tick, 2500);
+				return;
+			}
+			if (state.filled) {
+				schedule(tick, 1800);
+				return;
+			}
+			win.webContents.executeJavaScript(fillScript, true).then((result) => {
+				if (win.isDestroyed() || state.done) return;
+				if (!result || !result.filled) {
+					if (!state.warned) {
+						state.warned = true;
+						oiEmitProgress({
+							stage: "cf-need-action",
+							message: "没找到提交表单：先在这个窗口里登录 Codeforces；登录后会自动把代码填进去。"
+						});
+					}
+				} else {
+					state.filled = true;
+					oiEmitProgress({
+						stage: "cf-filled",
+						pid: pidValue,
+						language: result.language,
+						message: "代码已填好（" + (result.language || "默认语言") + "）。确认题号和语言后，点页面上的 Submit —— 人机验证也在这个窗口里过。"
+					});
+				}
+				schedule(tick, 1800);
+			}).catch(() => schedule(tick, 2000));
+		}).catch(() => schedule(tick, 2000));
+	};
+
+	win.webContents.on("did-finish-load", () => {
+		const href = win.webContents.getURL();
+		if (/\/submit/.test(href)) state.filled = false;
+		schedule(tick, 500);
+	});
+	win.on("closed", () => {
+		oiCfStopTimers();
+		oiCfWindow = null;
+	});
+	win.loadURL(submitUrl);
+	return { ok: true, site: "codeforces", window: true, pid: info.contestId + info.index };
+}
+
+/**
+* 比赛报名。
+* 洛谷：POST /contest/{id}/join（csrf 从比赛页 meta 取）
+* AtCoder：GET /contests/{id}/register 拿 csrf，再 POST 同一个地址
+* Codeforces：报名页在 Cloudflare 后面，开窗口勾好"参加"，由用户点 Register
+*/
+async function oiContestJoin(siteKey, contestId) {
+	const id = String(contestId || "").trim();
+	if (!id) return { ok: false, error: "缺少比赛 ID" };
+	if (siteKey === "codeforces") return oiCfRegisterWindow(id);
+	if (siteKey === "atcoder") return oiAtCoderJoin(id);
+	if (siteKey === "luogu") return oiLuoguJoin(id);
+	return { ok: false, error: "不认识的站点" };
+}
+
+async function oiLuoguJoin(contestId) {
+	const pageUrl = "https://www.luogu.com.cn/contest/" + encodeURIComponent(contestId);
+	let res;
+	try {
+		res = await oiHttpFetch(pageUrl, { accept: "text/html" });
+	} catch (error) {
+		return { ok: false, error: "连不上洛谷：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const html = await res.text();
+	let payload = null;
+	try {
+		payload = JSON.parse(html);
+	} catch {
+		payload = oiExtractLentille(html) || oiExtractFeInjection(html);
+	}
+	const user = payload && payload.user;
+	if (!user || !(user.uid || user.name)) return {
+		ok: false,
+		needLogin: true,
+		error: "洛谷还没登录：先点「登录 / 检查登录」。"
+	};
+	const data = payload && (payload.currentData || payload.data) || {};
+	if (Number(data.joined) === 1) return {
+		ok: true,
+		already: true,
+		message: "这场比赛你已经报名过了"
+	};
+	const contest = data.contest || {};
+	if (contest.endTime && Number(contest.endTime) * 1000 < Date.now()) return {
+		ok: false,
+		error: "这场比赛已经结束了，报不上名"
+	};
+	const csrfMatch = /<meta name="csrf-token" content="([^"]+)"/.exec(html);
+	let res2;
+	try {
+		res2 = await oiHttpFetch(pageUrl + "/join", {
+			"content-type": "application/json",
+			"x-csrf-token": csrfMatch ? csrfMatch[1] : "",
+			"x-requested-with": "XMLHttpRequest",
+			referer: pageUrl,
+			origin: "https://www.luogu.com.cn",
+			accept: "application/json"
+		}, { method: "POST", body: "{}" });
+	} catch (error) {
+		return { ok: false, error: "报名请求失败：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const text = await res2.text();
+	let out = null;
+	try {
+		out = JSON.parse(text);
+	} catch {}
+	if (!res2.ok || out && out.errorCode) {
+		const message = out ? String(out.errorMessage || out.errorType || "") : "HTTP " + res2.status;
+		if (/Unlogin|未登录|尚未登录|登录/i.test(message)) return {
+			ok: false,
+			needLogin: true,
+			error: "洛谷登录已失效，重新登录一次再报名。"
+		};
+		return { ok: false, error: "报名失败：" + message };
+	}
+	return {
+		ok: true,
+		message: "报名成功"
+	};
+}
+
+async function oiAtCoderJoin(contestId) {
+	const url = "https://atcoder.jp/contests/" + encodeURIComponent(contestId) + "/register";
+	let res;
+	try {
+		res = await oiHttpFetch(url, { accept: "text/html" });
+	} catch (error) {
+		return { ok: false, error: "连不上 AtCoder：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const html = await res.text();
+	if (/name="password"/i.test(html) || /\/login/i.test(String(res.url || ""))) return {
+		ok: false,
+		needLogin: true,
+		error: "AtCoder 还没登录：先点「登录 / 检查登录」。"
+	};
+	const csrfMatch = /name="csrf_token"\s+value="([^"]+)"/.exec(html);
+	if (!csrfMatch) {
+		if (/already|registered|登録済み/i.test(html)) return {
+			ok: true,
+			already: true,
+			message: "这场比赛你已经报名过了"
+		};
+		return { ok: false, error: "没找到报名表单：这场比赛可能不需要报名，或者已经结束。" };
+	}
+	const body = new URLSearchParams({
+		csrf_token: csrfMatch[1],
+		agree: "true"
+	}).toString();
+	let res2;
+	try {
+		res2 = await oiHttpFetch(url, {
+			"content-type": "application/x-www-form-urlencoded",
+			referer: url,
+			origin: "https://atcoder.jp",
+			accept: "text/html"
+		}, { method: "POST", body });
+	} catch (error) {
+		return { ok: false, error: "报名请求失败：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const finalUrl = String(res2.url || "");
+	const out = await res2.text();
+	if (/\/register(\?|$)/.test(finalUrl)) {
+		const alertMatch = /<div class="alert alert-danger">([\s\S]*?)<\/div>/.exec(out);
+		return {
+			ok: false,
+			error: alertMatch ? oiDecodeEntities(oiStripTags(alertMatch[1])).trim() : "报名没有成功（可能需要先同意条款，或比赛已结束）"
+		};
+	}
+	return {
+		ok: true,
+		message: "报名成功"
+	};
+}
+
+function oiCfRegisterWindow(contestId) {
+	const url = "https://codeforces.com/contestRegistration/" + encodeURIComponent(contestId);
+	try {
+		if (oiCfWindow && !oiCfWindow.isDestroyed()) oiCfWindow.close();
+	} catch {}
+	const win = new electron.BrowserWindow({
+		width: 900,
+		height: 760,
+		title: "Codeforces 报名 · 确认后点 Register",
+		parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : void 0,
+		autoHideMenuBar: true,
+		webPreferences: {
+			sandbox: true,
+			contextIsolation: true,
+			nodeIntegration: false,
+			spellcheck: false
+		}
+	});
+	oiCfWindow = win;
+	try {
+		win.webContents.setUserAgent(OI_UA);
+	} catch {}
+	const script = "(function(){" +
+		"var box=document.querySelector('input[name=\"takePart\"]');" +
+		"if(box&&!box.checked){box.checked=true;box.dispatchEvent(new Event('change',{bubbles:true}));}" +
+		"var btn=document.querySelector('input[type=\"submit\"], button[type=\"submit\"], .submit');" +
+		"return {hasBox:!!box,hasButton:!!btn,text:document.body?document.body.innerText.slice(0,120):''};" +
+		"})()";
+	win.webContents.on("did-finish-load", () => {
+		if (win.isDestroyed()) return;
+		if (/\/login|\/enter/i.test(win.webContents.getURL())) {
+			oiEmitProgress({
+				stage: "cf-register",
+				ok: false,
+				needLogin: true,
+				message: "Codeforces 还没登录：在这个窗口里登录一次，登录后重新点「报名」。"
+			});
+			return;
+		}
+		win.webContents.executeJavaScript(script, true).then((result) => {
+			oiEmitProgress({
+				stage: "cf-register",
+				ok: true,
+				message: result && result.hasButton
+					? "已勾选「参加」，确认信息后点页面上的 Register 完成报名。"
+					: "已打开报名页：按页面提示完成报名（可能要过一次人机验证）。"
+			});
+		}).catch(() => {});
+	});
+	win.loadURL(url);
+	return {
+		ok: true,
+		window: true,
+		message: "已打开 Codeforces 报名页：勾选好参赛选项，点 Register 即可。"
+	};
+}
+
+/* ---------------- 比赛列表 / 整场导入 ---------------- */
+
+async function oiContestList(source) {
+	if (source === "codeforces") {
+		let res;
+		try {
+			res = await oiHttpFetch("https://codeforces.com/api/contest.list?gym=false", { accept: "application/json" });
+		} catch (error) {
+			return { ok: false, error: "连不上 Codeforces：" + (error instanceof Error ? error.message : String(error)) };
+		}
+		if (!res.ok) return { ok: false, error: "Codeforces 返回 HTTP " + res.status };
+		const data = await res.json().catch(() => null);
+		if (!data || data.status !== "OK") return { ok: false, error: "Codeforces 接口返回异常" };
+		const contests = (data.result || []).filter((item) => item.phase === "BEFORE" || item.phase === "CODING").sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).map((item) => ({
+			id: String(item.id),
+			name: item.name,
+			startTime: item.startTimeSeconds * 1000,
+			durationSec: item.durationSeconds,
+			phase: item.phase
+		}));
+		return { ok: true, source, contests };
+	}
+	if (source === "atcoder") {
+		let res;
+		try {
+			res = await oiHttpFetch("https://atcoder.jp/contests/", { accept: "text/html" });
+		} catch (error) {
+			return { ok: false, error: "连不上 AtCoder：" + (error instanceof Error ? error.message : String(error)) };
+		}
+		if (!res.ok) return { ok: false, error: "AtCoder 返回 HTTP " + res.status };
+		const html = await res.text();
+		const seen = {};
+		const contests = [];
+		const rowRe = /<tr>([\s\S]*?)<\/tr>/gi;
+		let row;
+		while ((row = rowRe.exec(html))) {
+			const body = row[1];
+			const link = /<a href="\/contests\/([A-Za-z0-9_-]+)">([^<]+)<\/a>/.exec(body);
+			const time = /<time[^>]*>([^<]+)<\/time>/.exec(body);
+			if (!link || !time) continue;
+			const id = link[1];
+			if (seen[id]) continue;
+			const start = Date.parse(time[1].trim().replace(" ", "T"));
+			if (!start || Number.isNaN(start)) continue;
+			const duration = /<td class="text-center">([0-9]+):([0-9]+)<\/td>/.exec(body);
+			const durationSec = duration ? (Number(duration[1]) * 60 + Number(duration[2])) * 60 : 0;
+			seen[id] = true;
+			contests.push({
+				id,
+				name: oiDecodeEntities(link[2]).trim(),
+				startTime: start,
+				durationSec,
+				phase: start > Date.now() ? "BEFORE" : (durationSec && start + durationSec * 1000 > Date.now() ? "CODING" : "FINISHED")
+			});
+		}
+		contests.sort((a, b) => a.startTime - b.startTime);
+		const now = Date.now();
+		return {
+			ok: true,
+			source,
+			contests: contests.filter((item) => item.startTime > now - 36 * 3600 * 1000)
+		};
+	}
+	// 洛谷
+	let res;
+	try {
+		res = await oiHttpFetch("https://www.luogu.com.cn/contest/list?_contentOnly=1", {
+			"x-luogu-type": "content-only",
+			accept: "application/json, text/html"
+		});
+	} catch (error) {
+		return { ok: false, error: "连不上洛谷：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const text = await res.text();
+	let payload = null;
+	try {
+		payload = JSON.parse(text);
+	} catch {
+		payload = oiExtractLentille(text) || oiExtractFeInjection(text);
+	}
+	const data = payload && (payload.currentData || payload.data) || {};
+	const list = data.contests && data.contests.result || [];
+	const now = Date.now();
+	return {
+		ok: true,
+		source: "luogu",
+		contests: list.filter((item) => Number(item.endTime) * 1000 > now - 7 * 24 * 3600 * 1000).map((item) => ({
+			id: String(item.id),
+			name: item.name,
+			startTime: Number(item.startTime) * 1000,
+			durationSec: Number(item.endTime) - Number(item.startTime),
+			phase: Number(item.startTime) * 1000 > now ? "BEFORE" : (Number(item.endTime) * 1000 > now ? "CODING" : "FINISHED")
+		}))
+	};
+}
+
+async function oiContestProblems(source, contestId) {
+	if (!contestId) return { ok: false, error: "缺少比赛 ID" };
+	if (source === "codeforces") {
+		let apiError = "";
+		try {
+			const res = await oiHttpFetch("https://codeforces.com/api/contest.standings?contestId=" + encodeURIComponent(contestId) + "&from=1&count=1", { accept: "application/json" });
+			const data = await res.json().catch(() => null);
+			if (data && data.status === "OK" && data.result && data.result.problems) {
+				return {
+					ok: true,
+					name: "Codeforces " + contestId,
+					problems: data.result.problems.map((item) => ({
+						pid: String(contestId) + item.index,
+						title: item.name,
+						index: item.index
+					}))
+				};
+			}
+			apiError = data && data.comment || "";
+		} catch (error) {
+			apiError = error instanceof Error ? error.message : String(error);
+		}
+		// CF 对非管理员只允许"无额外参数"的匿名 standings 请求，
+		// 带 from/count 会被 400 拒掉（正在进行/已结束的比赛都一样），
+		// 所以拿不到就退一步直接解析比赛页里的题目表格。
+		const page = await oiBrowserHtml("https://codeforces.com/contest/" + encodeURIComponent(contestId), { waitMs: 15000 });
+		if (!page.ok) return { ok: false, error: "打不开 Codeforces 比赛页：" + page.error };
+		if (/Just a moment|cf-challenge/i.test(page.html.slice(0, 8000))) return {
+			ok: false,
+			error: "Codeforces 的人机验证没通过：先在登录窗口里过一次验证再导入。"
+		};
+		const found = {};
+		// Codeforces 把题目标题包在 <!-- --> 注释里（<a href="..."><!-- -->标题<!-- --></a>），
+		// 不去掉注释的话尖括号会直接把标题截断成空字符串。
+		const clean = page.html.replace(/<!--[\s\S]*?-->/g, "");
+		const linkRe = /<a[^>]+href="\/contest\/([0-9]+)\/problem\/([A-Za-z0-9]+)"[^>]*>([^<]*)<\/a>/g;
+		let match;
+		while ((match = linkRe.exec(clean))) {
+			const index = String(match[2]).toUpperCase();
+			const text = oiDecodeEntities(match[3]).trim();
+			const prev = found[index];
+			if (!prev || text.length > prev.title.length) found[index] = {
+				index,
+				title: text || index
+			};
+		}
+		const problems = Object.keys(found).sort().map((index) => ({
+			pid: String(contestId) + index,
+			title: found[index].title,
+			index
+		}));
+		if (!problems.length) return {
+			ok: false,
+			error: "没在比赛页里找到题目" + (apiError ? "（接口说：" + apiError + "）" : "（比赛可能还没开始）")
+		};
+		return { ok: true, name: "Codeforces " + contestId, problems };
+	}
+	if (source === "atcoder") {
+		let res;
+		try {
+			res = await oiHttpFetch("https://atcoder.jp/contests/" + encodeURIComponent(contestId) + "/tasks", { accept: "text/html" });
+		} catch (error) {
+			return { ok: false, error: "连不上 AtCoder：" + (error instanceof Error ? error.message : String(error)) };
+		}
+		if (!res.ok) return { ok: false, error: "AtCoder 返回 HTTP " + res.status + "（比赛 ID 对不对？）" };
+		const html = await res.text();
+		// 每个题在表格里出现两次：一次是字母 A，一次是完整标题。
+		// 之前只留第一个，结果标题全是 "A"、"B" —— 这里改成留更长的那个。
+		const titles = {};
+		const order = [];
+		const linkRe = new RegExp("<a href=\"/contests/" + contestId + "/tasks/([A-Za-z0-9_-]+)\">([^<]+)</a>", "g");
+		let match;
+		while ((match = linkRe.exec(html))) {
+			const pid = match[1];
+			const text = oiDecodeEntities(match[2]).trim();
+			if (!titles[pid]) {
+				titles[pid] = text;
+				order.push(pid);
+			} else if (text.length > titles[pid].length) titles[pid] = text;
+		}
+		const problems = order.map((pid) => ({
+			pid,
+			title: titles[pid]
+		}));
+		if (!problems.length) return { ok: false, error: "没在这场比赛里找到题目" };
+		return { ok: true, name: "AtCoder " + contestId, problems };
+	}
+	let res;
+	try {
+		res = await oiHttpFetch("https://www.luogu.com.cn/contest/" + encodeURIComponent(contestId) + "?_contentOnly=1", {
+			"x-luogu-type": "content-only",
+			accept: "application/json, text/html"
+		});
+	} catch (error) {
+		return { ok: false, error: "连不上洛谷：" + (error instanceof Error ? error.message : String(error)) };
+	}
+	const text = await res.text();
+	let payload = null;
+	try {
+		payload = JSON.parse(text);
+	} catch {
+		payload = oiExtractLentille(text) || oiExtractFeInjection(text);
+	}
+	const data = payload && (payload.currentData || payload.data) || {};
+	const contest = data.contest || {};
+	// 洛谷把题目放在 data.contestProblems 里（不是 contest.problems），
+	// 结构是 [{no:"A", score:100, problem:{pid, name}}]
+	const raw = data.contestProblems || contest.problems || [];
+	if (!raw.length) return {
+		ok: false,
+		error: contest.startTime && Number(contest.startTime) * 1000 > Date.now()
+			? "这场比赛还没开始：题目开赛后才会公开。"
+			: "这场比赛没有可导入的题目（可能已下架，或题目还没公开）。"
+	};
+	return {
+		ok: true,
+		name: contest.name || ("洛谷比赛 " + contestId),
+		problems: raw.map((item) => item.problem ? {
+			pid: item.problem.pid,
+			title: (item.no ? item.no + ". " : "") + (item.problem.name || item.problem.pid)
+		} : {
+			pid: item.pid,
+			title: item.title || item.pid
+		})
+	};
+}
+
+async function oiImportContest(root, payload) {
+	const source = String(payload && payload.site || "luogu");
+	const contestId = String(payload && payload.contestId || "").trim();
+	const list = await oiContestProblems(source, contestId);
+	if (!list.ok) return list;
+	const imported = [];
+	const failed = [];
+	for (let index = 0; index < list.problems.length; index += 1) {
+		const item = list.problems[index];
+		oiEmitProgress({
+			stage: "import",
+			site: source,
+			contestId,
+			index: index + 1,
+			total: list.problems.length,
+			pid: item.pid,
+			title: item.title
+		});
+		const problem = await oiFetchProblem(source, item.pid);
+		if (!problem.ok) {
+			failed.push({ pid: item.pid, error: problem.error });
+			continue;
+		}
+		try {
+			const result = await oiImportProblem(root, source, item.pid, problem, contestId + "/" + item.pid);
+			imported.push({ pid: item.pid, title: problem.title || item.title, dir: result.dir, code: result.code, samples: result.samples });
+		} catch (error) {
+			failed.push({ pid: item.pid, error: error instanceof Error ? error.message : String(error) });
+		}
+	}
+	return { ok: true, site: source, contestId, name: list.name, imported, failed };
+}
+
+/* ---------------- Git ---------------- */
+function oiExecFile(command, args, cwd) {
+	return new Promise((resolve) => {
+		(0, node_child_process).execFile(command, args, {
+			cwd,
+			windowsHide: true,
+			maxBuffer: 4e6,
+			encoding: "utf8"
+		}, (error, stdout, stderr) => {
+			resolve({
+				ok: !error,
+				code: error && typeof error.code === "number" ? error.code : error ? 1 : 0,
+				stdout: String(stdout || ""),
+				stderr: String(stderr || "") || (error ? String(error.message || error) : "")
+			});
+		});
+	});
+}
+/** 会在等待输入凭据时挂住的操作，加点超时兜底 */
+function oiExecFileTimed(command, args, cwd, timeoutMs) {
+	return new Promise((resolve) => {
+		(0, node_child_process).execFile(command, args, {
+			cwd,
+			windowsHide: true,
+			maxBuffer: 4e6,
+			encoding: "utf8",
+			timeout: timeoutMs
+		}, (error, stdout, stderr) => {
+			resolve({
+				ok: !error,
+				timedOut: !!(error && error.killed),
+				code: error && typeof error.code === "number" ? error.code : error ? 1 : 0,
+				stdout: String(stdout || ""),
+				stderr: String(stderr || "") || (error && !error.killed ? String(error.message || error) : "")
+			});
+		});
+	});
+}
+async function oiGit(root, action, payload) {
+	const probe = await oiExecFile("git", ["--version"], root);
+	if (!probe.ok) return {
+		ok: false,
+		error: "没有找到 git。装一个 Git for Windows 就能用。"
+	};
+	const version = probe.stdout.trim();
+	if (action === "status") {
+		const branch = await oiExecFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], root);
+		const status = await oiExecFile("git", ["status", "--porcelain=v1"], root);
+		const lines = status.stdout.split(/\r?\n/).filter(Boolean);
+		return {
+			ok: true,
+			version,
+			isRepo: branch.ok,
+			branch: branch.ok ? branch.stdout.trim() : "",
+			changes: lines.length,
+			entries: lines.slice(0, 200).map((line) => ({
+				code: line.slice(0, 2).trim(),
+				path: line.slice(3)
+			}))
+		};
+	}
+	if (action === "init") {
+		const init = await oiExecFile("git", ["init"], root);
+		return init.ok ? {
+			ok: true,
+			message: "已初始化仓库"
+		} : {
+			ok: false,
+			error: init.stderr || init.stdout
+		};
+	}
+	if (action === "commit") {
+		const message = String(payload && payload.message || "").trim();
+		if (!message) return {
+			ok: false,
+			error: "提交信息不能为空"
+		};
+		const add = await oiExecFile("git", ["add", "-A"], root);
+		if (!add.ok) return {
+			ok: false,
+			error: add.stderr || "git add 失败"
+		};
+		const commit = await oiExecFile("git", ["commit", "-m", message], root);
+		return commit.ok ? {
+			ok: true,
+			message: "已提交"
+		} : {
+			ok: false,
+			error: commit.stderr || commit.stdout || "提交失败（可能没有改动）"
+		};
+	}
+	if (action === "log") {
+		const log = await oiExecFile("git", ["log", "--oneline", "-n", "30"], root);
+		return log.ok ? {
+			ok: true,
+			entries: log.stdout.split(/\r?\n/).filter(Boolean)
+		} : {
+			ok: false,
+			error: log.stderr || "还没有任何提交"
+		};
+	}
+	if (action === "pull" || action === "push" || action === "fetch") {
+		const sub = action === "pull" ? ["pull", "--ff-only"] : action === "push" ? ["push"] : ["fetch", "--prune"];
+		const r = await oiExecFileTimed("git", sub, root, 12e4);
+		if (r.timedOut) return {
+			ok: false,
+			error: `git ${action} 超时（多半在等账号密码）。先在本机终端里跑一次把这个远端认下来，再回来重试。`
+		};
+		const out = (r.stdout || "").trim();
+		const err = (r.stderr || "").trim();
+		if (!r.ok) return {
+			ok: false,
+			error: err || out || `git ${action} 失败`
+		};
+		return {
+			ok: true,
+			message: [out, err].filter(Boolean).join("\n") || `git ${action} 完成`
+		};
+	}
+	if (action === "branches") {
+		const cur = await oiExecFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], root);
+		const list = await oiExecFile("git", ["branch", "--format=%(refname:short)"], root);
+		return {
+			ok: true,
+			current: cur.ok ? cur.stdout.trim() : "",
+			branches: list.ok ? list.stdout.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) : []
+		};
+	}
+	if (action === "checkout") {
+		const name = String(payload && payload.branch || "").trim();
+		if (!name || name.startsWith("-")) return {
+			ok: false,
+			error: "分支名不合法"
+		};
+		const r = await oiExecFile("git", ["checkout", name], root);
+		return r.ok ? {
+			ok: true,
+			message: `已切到 ${name}`
+		} : {
+			ok: false,
+			error: (r.stderr || r.stdout || "切换分支失败").trim()
+		};
+	}
+	if (action === "diff") {
+		const r = await oiExecFile("git", ["diff", "--stat"], root);
+		return r.ok ? {
+			ok: true,
+			text: r.stdout.trim() || "工作区没有未暂存的改动"
+		} : {
+			ok: false,
+			error: (r.stderr || "读不到 diff").trim()
+		};
+	}
+	if (action === "remote") {
+		const r = await oiExecFile("git", ["remote", "-v"], root);
+		const text = r.stdout.trim();
+		return {
+			ok: r.ok,
+			remotes: text,
+			error: r.ok ? undefined : (r.stderr || "没有配置远端").trim()
+		};
+	}
+	if (action === "version") return {
+		ok: true,
+		version
+	};
+	return {
+		ok: false,
+		error: "不认识的操作"
+	};
+}
+//#endregion
+//#region src/main/appearance.ts
+/**
+* 壁纸与透明度。
+*
+* 存在 userData/appearance.json（不是工作区里）——这是"这台机器的观感"，
+* 而且壁纸要记绝对路径，不适合塞进 settings.json 那套只认枚举的 schema。
+*/
+var MEDIA_MIME = {
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".webp": "image/webp",
+	".gif": "image/gif",
+	".bmp": "image/bmp",
+	".avif": "image/avif",
+	".svg": "image/svg+xml",
+	".mp4": "video/mp4",
+	".m4v": "video/mp4",
+	".webm": "video/webm",
+	".ogv": "video/ogg",
+	".ogg": "video/ogg",
+	".mov": "video/quicktime",
+	".mkv": "video/x-matroska"
+};
+var IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif", ".svg"];
+var VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".ogv", ".ogg", ".mov", ".mkv"];
+/** 太大的图转 base64 会把内存顶起来，超过这个就不转（视频一律走协议，不占内存） */
+var MAX_WALLPAPER_BYTES = 24 * 1024 * 1024;
+var APPEARANCE_DEFAULT = {
+	/** 背景媒体文件的绝对路径（图片或视频） */
+	mediaPath: null,
+	/** "image" | "video" | null */
+	mediaKind: null,
+	/** 1.1.0 的旧字段，只为兼容旧配置，读取时会自动迁移到 mediaPath */
+	wallpaper: null,
+	/** 背景铺法：cover 铺满 / contain 完整显示 / fill 拉伸 / tile 平铺 */
+	fit: "cover",
+	/** 背景模糊半径（px） */
+	blur: 0,
+	/** 背景压暗程度 0~1 */
+	dim: .18,
+	/** 视频：循环 / 静音 / 播放倍速 */
+	videoLoop: true,
+	videoMuted: true,
+	videoRate: 1,
+	panelOpacity: .72,
+	editorOpacity: 1,
+	/** 主题预设 id（渲染层定义具体配色） */
+	themeId: "default",
+	/** 自定义强调色 #rrggbb，空字符串表示跟随主题 */
+	accent: ""
+};
+function appearanceFile() {
+	return (0, node_path.join)(electron.app.getPath("userData"), "appearance.json");
+}
+function clampUnit(value, fallback) {
+	const n = Number(value);
+	if (!Number.isFinite(n)) return fallback;
+	return Math.min(1, Math.max(0, n));
+}
+function clampRange(value, fallback, min, max) {
+	const n = Number(value);
+	if (!Number.isFinite(n)) return fallback;
+	return Math.min(max, Math.max(min, n));
+}
+function mediaKindFor(file) {
+	if (!file) return null;
+	const ext = (0, node_path.extname)(String(file)).toLowerCase();
+	if (IMAGE_EXTENSIONS.includes(ext)) return "image";
+	if (VIDEO_EXTENSIONS.includes(ext)) return "video";
+	return null;
+}
+var FIT_VALUES = ["cover", "contain", "fill", "tile"];
+var THEME_ID_PATTERN = /^[a-z0-9-]{1,32}$/;
+function sanitizeAppearance(raw) {
+	const input = raw && typeof raw === "object" ? raw : {};
+	const rawPath = typeof input.mediaPath === "string" && input.mediaPath.trim() ? input.mediaPath : typeof input.wallpaper === "string" && input.wallpaper.trim() ? input.wallpaper : null;
+	const mediaPath = rawPath ? (0, node_path.resolve)(rawPath) : null;
+	const mediaKind = mediaPath ? mediaKindFor(mediaPath) ?? (input.mediaKind === "video" ? "video" : input.mediaKind === "image" ? "image" : null) : null;
+	const accent = typeof input.accent === "string" && /^#[0-9a-fA-F]{6}$/.test(input.accent.trim()) ? input.accent.trim().toLowerCase() : "";
+	return {
+		mediaPath,
+		mediaKind,
+		wallpaper: mediaPath,
+		fit: FIT_VALUES.includes(input.fit) ? input.fit : APPEARANCE_DEFAULT.fit,
+		blur: Math.round(clampRange(input.blur, APPEARANCE_DEFAULT.blur, 0, 40)),
+		dim: clampUnit(input.dim, APPEARANCE_DEFAULT.dim),
+		videoLoop: input.videoLoop !== false,
+		videoMuted: input.videoMuted !== false,
+		videoRate: clampRange(input.videoRate, APPEARANCE_DEFAULT.videoRate, .25, 4),
+		panelOpacity: clampUnit(input.panelOpacity, APPEARANCE_DEFAULT.panelOpacity),
+		editorOpacity: clampUnit(input.editorOpacity, APPEARANCE_DEFAULT.editorOpacity),
+		themeId: typeof input.themeId === "string" && THEME_ID_PATTERN.test(input.themeId) ? input.themeId : APPEARANCE_DEFAULT.themeId,
+		accent
+	};
+}
+function loadAppearance() {
+	try {
+		return sanitizeAppearance(JSON.parse(node_fs.readFileSync(appearanceFile(), "utf8").replace(/^\uFEFF/, "")));
+	} catch {
+		return { ...APPEARANCE_DEFAULT };
+	}
+}
+function saveAppearance(raw) {
+	const value = sanitizeAppearance(raw);
+	try {
+		node_fs.mkdirSync((0, node_path.dirname)(appearanceFile()), { recursive: true });
+		node_fs.writeFileSync(appearanceFile(), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	} catch {}
+	return value;
+}
+/** 小图转 data URL：渲染层是 app:// 源，自己引用 file:// 会被安全策略拦掉 */
+function wallpaperDataUrl(file) {
+	if (!file) return null;
+	try {
+		const mime = MEDIA_MIME[(0, node_path.extname)(file).toLowerCase()];
+		if (!mime || !mime.startsWith("image/")) return null;
+		const info = node_fs.statSync(file);
+		if (!info.isFile() || info.size > MAX_WALLPAPER_BYTES) return null;
+		return `data:${mime};base64,${node_fs.readFileSync(file).toString("base64")}`;
+	} catch {
+		return null;
+	}
+}
+/**
+* 背景媒体的访问地址。
+*
+* 带上 mtime 当版本号：用户换了一张同名文件时浏览器缓存不会命中旧内容。
+* 真正读盘在 sparkle-media 协议里，这里只给一个稳定的 URL。
+*/
+function mediaUrlFor(value) {
+	if (!value.mediaPath) return null;
+	try {
+		const info = node_fs.statSync(value.mediaPath);
+		if (!info.isFile()) return null;
+		return `sparkle-media://local/current?v=${info.size}-${Math.round(info.mtimeMs)}`;
+	} catch {
+		return null;
+	}
+}
+function appearancePayload() {
+	const value = loadAppearance();
+	const dataUrl = value.mediaKind === "image" ? wallpaperDataUrl(value.mediaPath) : null;
+	const mediaUrl = mediaUrlFor(value);
+	return {
+		...value,
+		dataUrl,
+		mediaUrl,
+		missing: Boolean(value.mediaPath) && !mediaUrl
+	};
+}
+/**
+* sparkle-media:// 的请求处理器。
+*
+* 安全边界：**只服务 appearance.json 里当前选中的那一个文件**。
+* 不做 "把 URL 里的路径映射到磁盘" 这种事 —— 那样等于给渲染层开了任意读盘的后门。
+*
+* Range 是必须的：<video> 拖动进度条、边下边播全靠 206 响应，
+* 一次性把 500 MB 读进内存既慢又容易把主进程拖垮。
+*/
+function serveMediaProtocol() {
+	electron.session.defaultSession.protocol.handle("sparkle-media", async (request) => {
+		const file = loadAppearance().mediaPath;
+		if (!file) return new Response("Not Found", { status: 404 });
+		let info;
+		try {
+			info = await node_fs_promises.stat(file);
+		} catch {
+			return new Response("Not Found", { status: 404 });
+		}
+		if (!info.isFile()) return new Response("Not Found", { status: 404 });
+		const size = info.size;
+		const mime = MEDIA_MIME[(0, node_path.extname)(file).toLowerCase()] ?? "application/octet-stream";
+		const headers = {
+			"content-type": mime,
+			"accept-ranges": "bytes",
+			"cache-control": "no-cache"
+		};
+		const rangeHeader = request.headers.get("range");
+		const match = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
+		if (match) {
+			let start = match[1] === "" ? null : Number(match[1]);
+			let end = match[2] === "" ? null : Number(match[2]);
+			if (start === null && end !== null) {
+				start = Math.max(0, size - end);
+				end = size - 1;
+			} else {
+				if (start === null) start = 0;
+				if (end === null || end >= size) end = size - 1;
+			}
+			if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) return new Response(null, {
+				status: 416,
+				headers: {
+					...headers,
+					"content-range": `bytes */${size}`
+				}
+			});
+			return new Response(node_stream.Readable.toWeb(node_fs.createReadStream(file, {
+				start,
+				end
+			})), {
+				status: 206,
+				headers: {
+					...headers,
+					"content-range": `bytes ${start}-${end}/${size}`,
+					"content-length": String(end - start + 1)
+				}
+			});
+		}
+		return new Response(node_stream.Readable.toWeb(node_fs.createReadStream(file)), {
+			status: 200,
+			headers: {
+				...headers,
+				"content-length": String(size)
+			}
+		});
+	});
+}
 //#region src/main/debugger.ts
 /**
 * 解析一个 MI 值：字符串 / 元组 / 列表。
@@ -4259,303 +7666,6 @@ var DebugSession = class {
 	}
 };
 //#endregion
-//#region src/main/settings.ts
-/**
-* 设置持久化。
-*
-* 跨会话生效的偏好都在这里：编辑器外观（字号/字体/行号/ minimap…）、
-* 下次启动要不要恢复上次的工作区、以及默认 C++ 标准。
-* 落盘 userData/settings.json；读一次之后走内存缓存。
-* 每次写入都做白名单校验 —— 坏值被丢掉并回落到默认值，而不是扩散下去。
-*/
-function settingsPath() {
-	return (0, node_path.join)(electron.app.getPath("userData"), "settings.json");
-}
-var SETTINGS_DEFAULTS = {
-	fontSize: 14,
-	fontFamily: "Consolas, \"Courier New\", monospace",
-	tabSize: 2,
-	wordWrap: "off",
-	lineNumbers: true,
-	minimap: true,
-	cursorBlinking: "smooth",
-	smoothScrolling: true,
-	renderWhitespace: "none",
-	restoreWorkspace: true,
-	lastWorkspaceRoot: "",
-	cppStandard: "",
-	language: "zh",
-	uiTheme: "dark",
-	ideTheme: "native"
-};
-var settingsCache = null;
-function readSettingsFile() {
-	try {
-		const parsed = JSON.parse((0, node_fs.readFileSync)(settingsPath(), "utf8"));
-		return typeof parsed === "object" && parsed !== null ? parsed : {};
-	} catch {
-		return {};
-	}
-}
-/** 单个键的白名单校验。返回 undefined 表示「这个值不能用，用默认」。 */
-function sanitizeSetting(key, value) {
-	switch (key) {
-		case "fontSize": {
-			const size = Math.round(Number(value));
-			return Number.isFinite(size) && size >= 8 && size <= 48 ? size : void 0;
-		}
-		case "tabSize": {
-			const size = Math.round(Number(value));
-			return Number.isFinite(size) && size >= 1 && size <= 8 ? size : void 0;
-		}
-		case "fontFamily":
-			return typeof value === "string" && value.trim().length > 0 && value.length <= 200 ? value.trim() : void 0;
-		case "wordWrap":
-			return ["off", "on", "wordWrapColumn", "bounded"].includes(value) ? value : void 0;
-		case "cursorBlinking":
-			return ["blink", "smooth", "phase", "expand", "solid"].includes(value) ? value : void 0;
-		case "renderWhitespace":
-			return ["none", "boundary", "selection", "trailing", "all"].includes(value) ? value : void 0;
-		case "lineNumbers":
-		case "minimap":
-		case "smoothScrolling":
-		case "restoreWorkspace":
-			return typeof value === "boolean" ? value : void 0;
-		case "lastWorkspaceRoot":
-			return typeof value === "string" && value.length > 0 && value.length <= 260 ? value : "";
-		case "cppStandard":
-			return ["", "auto", "c++11", "c++14", "c++17", "c++20", "c++23", "c++26"].includes(value) ? value : "";
-		case "language":
-			return ["zh", "en"].includes(value) ? value : void 0;
-		case "uiTheme":
-			return ["light", "dark"].includes(value) ? value : void 0;
-		case "ideTheme":
-			return ["native", "codeblocks", "devcpp", "geany"].includes(value) ? value : void 0;
-		default:
-			return void 0;
-	}
-}
-function loadSettings() {
-	if (settingsCache) return settingsCache;
-	const stored = readSettingsFile();
-	const merged = { ...SETTINGS_DEFAULTS };
-	for (const key of Object.keys(SETTINGS_DEFAULTS)) {
-		if (!(key in stored)) continue;
-		const clean = sanitizeSetting(key, stored[key]);
-		if (clean !== void 0) merged[key] = clean;
-	}
-	settingsCache = merged;
-	return merged;
-}
-function saveSettings(update) {
-	const current = loadSettings();
-	if (typeof update === "object" && update !== null) {
-		for (const [key, value] of Object.entries(update)) {
-			if (!(key in SETTINGS_DEFAULTS)) continue;
-			const clean = sanitizeSetting(key, value);
-			if (clean !== void 0) current[key] = clean;
-		}
-	}
-	try {
-		(0, node_fs.mkdirSync)((0, node_path.dirname)(settingsPath()), { recursive: true });
-		(0, node_fs.writeFileSync)(settingsPath(), JSON.stringify(current, null, 2), "utf8");
-	} catch (error) {
-		console.error("保存设置失败：", error);
-	}
-	return current;
-}
-//#endregion
-//#region src/main/luogu.ts
-/**
-* 洛谷题库客户端。
-*
-* 为什么不用 fetch：洛谷会对每个请求先 302 到同一个 URL 并种一个 C3VK
-* cookie，Node 的 fetch（undici）没有 cookie jar，会在重定向里打转。
-* 所以用 node:https 手动跟随重定向 + 自管 cookie jar，最多 5 跳、
-* 只允许 www.luogu.com.cn、12 秒超时、2MB 上限。
-*
-* 数据源是题目页/题库页内嵌的 <script id="lentille-context"> JSON，
-* 比 HTML 解析稳得多。题面按 pid 缓存 5 分钟，重复打开秒回。
-*/
-var LUOGU_ORIGIN = "https://www.luogu.com.cn";
-var LUOGU_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-var LUOGU_TIMEOUT_MS = 12e3;
-var LUOGU_MAX_BYTES = 2097152;
-var luoguCookieJar = /* @__PURE__ */ new Map();
-var luoguProblemCache = /* @__PURE__ */ new Map();
-var LUOGU_CACHE_TTL_MS = 3e5;
-function luoguStoreCookies(host, setCookieHeaders) {
-	if (!setCookieHeaders) return;
-	const list = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
-	let jar = luoguCookieJar.get(host);
-	if (!jar) {
-		jar = /* @__PURE__ */ new Map();
-		luoguCookieJar.set(host, jar);
-	}
-	for (const raw of list) {
-		const first = String(raw).split(";")[0];
-		const eq = first.indexOf("=");
-		if (eq <= 0) continue;
-		jar.set(first.slice(0, eq).trim(), first.slice(eq + 1).trim());
-	}
-}
-function luoguCookieHeader(host) {
-	const jar = luoguCookieJar.get(host);
-	if (!jar || jar.size === 0) return "";
-	return [...jar.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
-}
-function luoguGetText(url, depth = 0) {
-	return new Promise((resolve, reject) => {
-		if (depth > 5) {
-			reject(new Error("洛谷返回了太多重定向，可能是网络问题"));
-			return;
-		}
-		let parsed;
-		try {
-			parsed = new URL(url);
-		} catch {
-			reject(new Error(`URL 非法：${url}`));
-			return;
-		}
-		if (parsed.protocol !== "https:" || parsed.hostname !== "www.luogu.com.cn") {
-			reject(new Error("只允许访问 https://www.luogu.com.cn"));
-			return;
-		}
-		const cookie = luoguCookieHeader(parsed.hostname);
-		const request = node_https.get(parsed, {
-			headers: {
-				"user-agent": LUOGU_UA,
-				accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-				"accept-language": "zh-CN,zh;q=0.9",
-				...(cookie ? { cookie } : {})
-			}
-		}, (response) => {
-			const status = response.statusCode ?? 0;
-			const location = response.headers.location;
-			luoguStoreCookies(parsed.hostname, response.headers["set-cookie"]);
-			if (status >= 300 && status < 400 && location) {
-				response.resume();
-				luoguGetText(new URL(location, parsed).href, depth + 1).then(resolve, reject);
-				return;
-			}
-			if (status !== 200) {
-				response.resume();
-				reject(new Error(`洛谷返回了 HTTP ${status}`));
-				return;
-			}
-			const chunks = [];
-			let total = 0;
-			response.on("data", (chunk) => {
-				total += chunk.length;
-				if (total > LUOGU_MAX_BYTES) {
-					request.destroy(new Error("页面太大，已停止下载"));
-					return;
-				}
-				chunks.push(chunk);
-			});
-			response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-			response.on("error", reject);
-		});
-		request.setTimeout(LUOGU_TIMEOUT_MS, () => {
-			request.destroy(new Error("访问洛谷超时了，请检查网络连接"));
-		});
-		request.on("error", (error) => reject(error instanceof Error ? error : new Error(String(error))));
-	});
-}
-function luoguExtractContext(html) {
-	const marker = `<script id="lentille-context" type="application/json">`;
-	const start = html.indexOf(marker);
-	if (start < 0) return null;
-	const jsonStart = start + marker.length;
-	const end = html.indexOf("</script>", jsonStart);
-	if (end < 0) return null;
-	try {
-		return JSON.parse(html.slice(jsonStart, end));
-	} catch {
-		return null;
-	}
-}
-function luoguNormalizeProblem(raw, fallbackPid) {
-	const contenu = raw.contenu ?? {};
-	const limits = raw.limits ?? {};
-	const time = Array.isArray(limits.time) ? limits.time : [];
-	const memory = Array.isArray(limits.memory) ? limits.memory : [];
-	const pid = String(raw.pid ?? fallbackPid ?? "");
-	return {
-		pid,
-		title: String(contenu.name ?? raw.name ?? ""),
-		difficulty: typeof raw.difficulty === "number" ? raw.difficulty : null,
-		fullScore: typeof raw.fullScore === "number" ? raw.fullScore : null,
-		background: typeof contenu.background === "string" ? contenu.background : "",
-		description: typeof contenu.description === "string" ? contenu.description : "",
-		formatI: typeof contenu.formatI === "string" ? contenu.formatI : "",
-		formatO: typeof contenu.formatO === "string" ? contenu.formatO : "",
-		hint: typeof contenu.hint === "string" ? contenu.hint : "",
-		samples: Array.isArray(raw.samples) ? raw.samples.filter((pair) => Array.isArray(pair)).map((pair) => [String(pair[0] ?? ""), String(pair[1] ?? "")]) : [],
-		timeLimitMs: time.length > 0 ? [Math.min(...time), Math.max(...time)] : null,
-		memoryLimitKb: memory.length > 0 ? memory[0] : null,
-		totalSubmit: typeof raw.totalSubmit === "number" ? raw.totalSubmit : null,
-		totalAccepted: typeof raw.totalAccepted === "number" ? raw.totalAccepted : null,
-		tags: Array.isArray(raw.tags) ? raw.tags.filter((tag) => typeof tag === "number") : [],
-		provider: typeof raw.provider?.name === "string" ? raw.provider.name : "",
-		url: `${LUOGU_ORIGIN}/problem/${encodeURIComponent(pid)}`
-	};
-}
-async function luoguSearchProblems(options = {}) {
-	const keyword = String(options.keyword ?? "").trim().slice(0, 40);
-	const page = Math.min(Math.max(1, Math.floor(Number(options.page) || 1)), 500);
-	const difficulty = /^[0-7]$/.test(String(options.difficulty ?? "")) ? String(options.difficulty) : "";
-	const params = new URLSearchParams();
-	if (keyword) params.set("keyword", keyword);
-	params.set("page", String(page));
-	if (difficulty) params.set("difficulty", difficulty);
-	const html = await luoguGetText(`${LUOGU_ORIGIN}/problem/list?${params.toString()}`);
-	const context = luoguExtractContext(html);
-	const problems = context?.data?.problems;
-	const result = Array.isArray(problems?.result) ? problems.result : [];
-	const tags = {};
-	const tagPattern = /href="\/problem\/list\?tag=(\d+)"[^>]*>([^<]+)<\/a>/g;
-	let match;
-	while ((match = tagPattern.exec(html)) !== null) {
-		const id = Number(match[1]);
-		const name = match[2].trim();
-		if (Number.isFinite(id) && name) tags[id] = name;
-	}
-	return {
-		items: result.map((item) => ({
-			pid: String(item.pid ?? ""),
-			title: String(item.name ?? ""),
-			difficulty: typeof item.difficulty === "number" ? item.difficulty : null,
-			totalSubmit: typeof item.totalSubmit === "number" ? item.totalSubmit : null,
-			totalAccepted: typeof item.totalAccepted === "number" ? item.totalAccepted : null
-		})).filter((item) => item.pid.length > 0),
-		count: typeof problems?.count === "number" ? problems.count : result.length,
-		perPage: typeof problems?.perPage === "number" ? problems.perPage : 50,
-		page,
-		tags
-	};
-}
-async function luoguGetProblem(pid) {
-	const id = String(pid ?? "").trim();
-	if (!/^[A-Za-z]{1,3}[0-9][0-9A-Za-z]{0,7}$/.test(id)) throw new Error(`题目编号看起来不对：${id}`);
-	const cached = luoguProblemCache.get(id);
-	const now = Date.now();
-	if (cached && now - cached.at < LUOGU_CACHE_TTL_MS) return cached.problem;
-	let html;
-	try {
-		html = await luoguGetText(`${LUOGU_ORIGIN}/problem/${encodeURIComponent(id)}`);
-	} catch (error) {
-		if (/HTTP 404/.test(error?.message ?? "")) throw new Error(`洛谷上没有编号为 ${id} 的题目（可能编号写错了，或者这道题被隐藏了）`);
-		throw error;
-	}
-	const context = luoguExtractContext(html);
-	const raw = context?.data?.problem;
-	if (!raw) throw new Error(`没有找到题目 ${id}，可能是编号写错了`);
-	const problem = luoguNormalizeProblem(raw, id);
-	luoguProblemCache.set(id, { at: now, problem });
-	return problem;
-}
-//#endregion
 //#region src/main/index.ts
 registerAppSchemePrivileges();
 mark("mainLoaded");
@@ -4576,6 +7686,28 @@ var protocolLog = [];
 function sendToRenderer(channel, payload) {
 	if (!mainWindow || mainWindow.isDestroyed()) return;
 	mainWindow.webContents.send(channel, payload);
+}
+var pendingEditorRequests = /* @__PURE__ */ new Map();
+function requestRenderer(requestId, payload, timeoutMs) {
+	return new Promise((resolve, reject) => {
+		if (!mainWindow || mainWindow.isDestroyed()) {
+			reject(/* @__PURE__ */ new Error("主窗口不可用，无法访问编辑器"));
+			return;
+		}
+		const timer = setTimeout(() => {
+			pendingEditorRequests.delete(requestId);
+			reject(/* @__PURE__ */ new Error(`编辑器没有响应（${timeoutMs} ms 超时）`));
+		}, timeoutMs);
+		pendingEditorRequests.set(requestId, {
+			resolve,
+			reject,
+			timer
+		});
+		mainWindow.webContents.send(PLUGIN_CHANNELS.editorRequest, {
+			requestId,
+			payload
+		});
+	});
 }
 /**
 * 代码执行服务 —— 应用里唯一会真正运行用户代码的地方。
@@ -4646,7 +7778,9 @@ function createWindow() {
 			sandbox: true,
 			contextIsolation: true,
 			nodeIntegration: false,
-			spellcheck: false
+			spellcheck: false,
+			// 分屏里的 PDF / 网页预览用 <webview> 承载
+			webviewTag: true
 		}
 	});
 	window.once("ready-to-show", () => {
@@ -4656,6 +7790,27 @@ function createWindow() {
 	window.webContents.setWindowOpenHandler(({ url }) => {
 		electron.shell.openExternal(url);
 		return { action: "deny" };
+	});
+	/*
+	* 分屏里的 <webview> 是内置的本地页面，不会自己传 preload 进来；
+	* 这里仍然把 Node / preload 全部剥掉，并且只放行白名单协议，
+	* 免得将来有人往 src 里塞奇怪的东西。
+	*/
+	window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
+		delete webPreferences.preload;
+		webPreferences.nodeIntegration = false;
+		webPreferences.nodeIntegrationInSubFrames = false;
+		webPreferences.contextIsolation = true;
+		webPreferences.webSecurity = true;
+		const src = String(params.src || "");
+		if (!/^(https?|file|app|about|data|blob):/i.test(src)) event.preventDefault();
+	});
+	window.webContents.on("did-attach-webview", (_event, contents) => {
+		// 页面里 target=_blank 的链接交给系统浏览器，不在窗格里弹新窗口
+		contents.setWindowOpenHandler(({ url }) => {
+			if (/^https?:/i.test(url)) electron.shell.openExternal(url);
+			return { action: "deny" };
+		});
 	});
 	window.webContents.on("console-message", (...args) => {
 		const details = args[0];
@@ -4681,6 +7836,7 @@ electron.app.whenReady().then(async () => {
 		}
 	};
 	serveCustomProtocols(protocolOptions);
+	serveMediaProtocol();
 	mark("protocolReady");
 	pluginHost = new PluginHost({
 		roots: process.env.SPARKLE_BENCH_PLUGIN_ROOT ? [process.env.SPARKLE_BENCH_PLUGIN_ROOT] : [.../* @__PURE__ */ new Set([
@@ -4701,18 +7857,17 @@ electron.app.whenReady().then(async () => {
 			pluginDebug.push(message);
 			if (pluginDebug.length > 200) pluginDebug.shift();
 			recordDiagnostic("pluginDebug", pluginDebug);
-		}
+		},
+		requestRenderer
 	});
 	await pluginHost.initialize();
+	const bootSettings = await loadSettings(electron.app.getPath("userData"));
+	pluginHost.setDisabled(bootSettings.disabledPlugins);
 	mark("pluginsReady");
 	electron.ipcMain.handle(RUN_CHANNELS.interpreter, () => interpreterInfo());
 	electron.ipcMain.handle(RUN_CHANNELS.start, (_event, request) => runManager.start(request));
 	electron.ipcMain.handle(RUN_CHANNELS.stop, (_event, runId) => runManager.stop(runId));
-	electron.ipcMain.handle(FS_CHANNELS.openFolder, async () => {
-		const workspace = await openFolder(mainWindow);
-		if (workspace.root) saveSettings({ lastWorkspaceRoot: workspace.root });
-		return workspace;
-	});
+	electron.ipcMain.handle(FS_CHANNELS.openFolder, () => openFolder(mainWindow));
 	electron.ipcMain.handle(FS_CHANNELS.currentWorkspace, () => currentWorkspace());
 	electron.ipcMain.handle(FS_CHANNELS.readDirectory, (_event, path) => readDirectory(path ?? ""));
 	electron.ipcMain.handle(FS_CHANNELS.readFile, (_event, path) => readFileContent(path));
@@ -4720,11 +7875,279 @@ electron.app.whenReady().then(async () => {
 		saveFileCalls += 1;
 		return saveFile(path, content);
 	});
+
+	/**
+	* 另存为：给"还没打开文件夹就新建的未命名文件"用。
+	* 选好位置后把工作区切到它所在的目录（和「打开文件」一致），
+	* 这样存完立刻能在左边文件树里看到。
+	*/
+	electron.ipcMain.handle("fs:saveFileAs", async (_event, defaultName, content) => {
+		const text = String(content ?? "");
+		const options = {
+			title: "另存为",
+			defaultPath: String(defaultName || "未命名.txt"),
+			filters: [{
+				name: "C++ / Python 源文件",
+				extensions: ["cpp", "cc", "cxx", "c", "py"]
+			}, {
+				name: "所有文件",
+				extensions: ["*"]
+			}]
+		};
+		const result = mainWindow ? await electron.dialog.showSaveDialog(mainWindow, options) : await electron.dialog.showSaveDialog(options);
+		if (result.canceled || !result.filePath) return { ok: false, cancelled: true };
+		const picked = (0, node_path.resolve)(result.filePath);
+		const currentRoot = currentWorkspace().root;
+		if (!(currentRoot ? picked.toLowerCase().startsWith(`${(0, node_path.resolve)(currentRoot).toLowerCase()}\\`) : false)) setWorkspaceRoot((0, node_path.dirname)(picked));
+		const workspace = currentWorkspace();
+		const base = (0, node_path.resolve)(workspace.root ?? (0, node_path.dirname)(picked));
+		const relative = picked.slice(base.length).replace(/^[\\/]+/, "").replace(/\\/g, "/");
+		await saveFile$1(base, relative || (0, node_path.basename)(picked), text);
+		return {
+			ok: true,
+			workspace,
+			path: relative,
+			name: (0, node_path.basename)(picked)
+		};
+	});
+
 	electron.ipcMain.handle(PLUGIN_CHANNELS.openFolder, async () => {
 		const directory = (0, node_path.join)(electron.app.getPath("userData"), "plugins");
 		await (0, node_fs_promises.mkdir)(directory, { recursive: true });
 		electron.shell.openPath(directory);
 		return directory;
+	});
+	electron.ipcMain.on(PLUGIN_CHANNELS.editorReply, (event, payload) => {
+		if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+		const reply = payload ?? {};
+		const requestId = String(reply.requestId ?? "");
+		const pending = pendingEditorRequests.get(requestId);
+		if (!pending) return;
+		clearTimeout(pending.timer);
+		pendingEditorRequests.delete(requestId);
+		if (reply.ok) pending.resolve(reply.result);
+		else pending.reject(new Error(String(reply.error ?? "编辑器拒绝了这次操作")));
+	});
+	electron.ipcMain.handle(PLUGIN_CHANNELS.formatDocument, async (_event, request) => {
+		if (!pluginHost) throw new Error("插件宿主尚未就绪");
+		const params = request ?? {};
+		return pluginHost.formatDocument(String(params.languageId ?? ""), String(params.content ?? ""));
+	});
+	electron.ipcMain.handle(PLUGIN_CHANNELS.listFormatters, () => {
+		if (!pluginHost) return {};
+		return pluginHost.listFormatters();
+	});
+	electron.ipcMain.handle(PLUGIN_CHANNELS.listCommands, () => {
+		if (!pluginHost) return [];
+		return pluginHost.listCommands();
+	});
+	electron.ipcMain.handle(PLUGIN_CHANNELS.executeCommand, async (_event, commandId) => {
+		if (!pluginHost) throw new Error("插件宿主尚未就绪");
+		return pluginHost.executeCommand(String(commandId ?? ""));
+	});
+	electron.ipcMain.handle("ai:loadConfig", () => ({
+		config: loadAiConfig(),
+		providers: AI_PROVIDERS
+	}));
+	electron.ipcMain.handle("ai:saveConfig", (_event, raw) => saveAiConfig(raw));
+	electron.ipcMain.handle("ai:chat", (event, request) => aiChat(event.sender, request));
+	electron.ipcMain.handle("ai:abort", (_event, id) => {
+		const controller = aiAborts.get(String(id));
+		if (!controller) return false;
+		try {
+			controller.abort();
+		} catch {}
+		return true;
+	});
+	electron.ipcMain.handle("oi:run", async (_event, request) => {
+		try {
+			const root = requireRoot();
+			if (request && request.kind === "stress") return oiStress(root, request);
+			return oiRunSamples(root, request);
+		} catch (error) {
+			return { ok: false, error: `先打开一个文件夹再测试（${error instanceof Error ? error.message : String(error)}）` };
+		}
+	});
+	electron.ipcMain.handle("oi:oj", async (_event, payload) => {
+		try {
+			const action = payload?.action;
+			const site = OJ_SITES[payload?.site] ? String(payload.site) : "luogu";
+			if (action === "login") return oiOpenLogin(site);
+			if (action === "status") return oiCheckLogin(site, payload?.verify);
+			if (action === "fetch") return oiFetchProblem(site, String(payload?.pid || ""));
+			if (action === "import") {
+				const problem = await oiFetchProblem(site, String(payload?.pid || ""));
+				if (!problem.ok) return problem;
+				return await oiImportProblem(requireRoot(), site, String(payload?.pid || ""), problem);
+			}
+			return { ok: false, error: "不认识的操作" };
+		} catch (error) {
+			return { ok: false, error: `操作失败：${error instanceof Error ? error.message : String(error)}（导入题目需要先打开一个文件夹）` };
+		}
+	});
+	electron.ipcMain.handle("oi:git", async (_event, payload) => {
+		try {
+			return await oiGit(requireRoot(), payload?.action, payload);
+		} catch (error) {
+			return { ok: false, error: `先打开一个文件夹再用 Git（${error instanceof Error ? error.message : String(error)}）` };
+		}
+	});
+	/**
+	* 读一张图片并转成 data URL。
+	*
+	* 题面里的图片是 `![](./1.png)` 这种相对路径，而界面跑在 app://bundle 下，
+	* 相对路径解析不到工作区里的文件 —— 于是让主进程读出来塞成 data URL。
+	* 只认图片扩展名，且限 8MB，免得被当成任意文件读取通道。
+	*/
+	electron.ipcMain.handle("fs:readImage", async (_event, rawPath) => {
+		try {
+			const target = resolveAnyPath(currentWorkspace().root, rawPath);
+			const mime = {
+				".png": "image/png",
+				".jpg": "image/jpeg",
+				".jpeg": "image/jpeg",
+				".gif": "image/gif",
+				".webp": "image/webp",
+				".bmp": "image/bmp",
+				".svg": "image/svg+xml",
+				".avif": "image/avif"
+			}[(0, node_path.extname)(target).toLowerCase()];
+			if (!mime) return {
+				ok: false,
+				error: `不是图片文件：${target}`
+			};
+			const info = await (0, node_fs_promises.stat)(target);
+			if (info.size > 8 * 1024 * 1024) return {
+				ok: false,
+				error: "图片超过 8MB，没有加载"
+			};
+			const data = await (0, node_fs_promises.readFile)(target);
+			return {
+				ok: true,
+				dataUrl: `data:${mime};base64,${data.toString("base64")}`
+			};
+		} catch (error) {
+			return {
+				ok: false,
+				error: error instanceof Error ? error.message : String(error)
+			};
+		}
+	});
+	electron.ipcMain.handle("git:exec", async (_event, payload) => {
+		try {
+			return await oiGit(requireRoot(), payload?.action, payload);
+		} catch (error) {
+			return { ok: false, error: `Git 面板需要先打开一个文件夹（${error instanceof Error ? error.message : String(error)}）` };
+		}
+	});
+	electron.ipcMain.handle("oi:submit", async (_event, payload) => {
+		try {
+			return await oiSubmit(payload);
+		} catch (error) {
+			return { ok: false, error: `提交失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	electron.ipcMain.handle("oi:submission", async (_event, payload) => {
+		try {
+			const site = String(payload?.site || "luogu");
+			if (site === "luogu") return await oiLuoguSubmission(payload?.rid);
+			if (site === "atcoder") return await oiAtCoderSubmission(payload?.contestId, payload?.sid);
+			return { ok: false, error: "这个站点的结果要在它自己的窗口里看" };
+		} catch (error) {
+			return { ok: false, error: `读取评测结果失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	electron.ipcMain.handle("oi:contests", async (_event, payload) => {
+		try {
+			return await oiContestList(String(payload?.source || "luogu"));
+		} catch (error) {
+			return { ok: false, error: `拉取比赛列表失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	electron.ipcMain.handle("oi:join", async (_event, payload) => {
+		try {
+			return await oiContestJoin(String(payload?.site || "luogu"), String(payload?.contestId || ""));
+		} catch (error) {
+			return { ok: false, error: `报名失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	electron.ipcMain.handle("oi:contestProblems", async (_event, payload) => {
+		try {
+			return await oiContestProblems(String(payload?.site || "luogu"), String(payload?.contestId || ""));
+		} catch (error) {
+			return { ok: false, error: `读取比赛题目失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	electron.ipcMain.handle("oi:importContest", async (_event, payload) => {
+		try {
+			return await oiImportContest(requireRoot(), payload);
+		} catch (error) {
+			return { ok: false, error: `导入比赛失败（先打开一个文件夹）：${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+	electron.ipcMain.handle("build:getConfig", () => loadBuildConfig());
+	electron.ipcMain.handle("build:setConfig", (_event, raw) => saveBuildConfig(raw));
+	electron.ipcMain.handle("appearance:load", () => appearancePayload());
+	electron.ipcMain.handle("appearance:pick", async () => {
+		const options = {
+			title: "选择背景（图片或视频）",
+			properties: ["openFile"],
+			filters: [{
+				name: "图片与视频",
+				extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "svg", "mp4", "m4v", "webm", "ogv", "ogg", "mov", "mkv"]
+			}, {
+				name: "图片",
+				extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "svg"]
+			}, {
+				name: "视频",
+				extensions: ["mp4", "m4v", "webm", "ogv", "ogg", "mov", "mkv"]
+			}, {
+				name: "所有文件",
+				extensions: ["*"]
+			}]
+		};
+		const result = mainWindow ? await electron.dialog.showOpenDialog(mainWindow, options) : await electron.dialog.showOpenDialog(options);
+		if (result.canceled || result.filePaths.length === 0) return { cancelled: true };
+		const picked = result.filePaths[0];
+		const current = loadAppearance();
+		const kind = mediaKindFor(picked);
+		if (!kind) return {
+			...appearancePayload(),
+			error: `不支持的文件类型：${(0, node_path.extname)(picked) || "（无扩展名）"}。图片支持 png / jpg / webp / gif / bmp / avif / svg，视频支持 mp4 / webm / ogv / mov / mkv。`
+		};
+		saveAppearance({
+			...current,
+			mediaPath: picked,
+			mediaKind: kind,
+			wallpaper: picked
+		});
+		return appearancePayload();
+	});
+	electron.ipcMain.handle("appearance:save", (_event, patch) => {
+		const current = loadAppearance();
+		const input = patch && typeof patch === "object" ? patch : {};
+		saveAppearance({
+			...current,
+			...input,
+			mediaPath: "mediaPath" in input ? input.mediaPath : current.mediaPath,
+			mediaKind: "mediaKind" in input ? input.mediaKind : current.mediaKind
+		});
+		return appearancePayload();
+	});
+	electron.ipcMain.handle("appearance:clear", () => {
+		saveAppearance({
+			...loadAppearance(),
+			mediaPath: null,
+			mediaKind: null,
+			wallpaper: null
+		});
+		return appearancePayload();
+	});
+	electron.ipcMain.handle(SETTINGS_CHANNELS.get, () => loadSettings(electron.app.getPath("userData")));
+	electron.ipcMain.handle(SETTINGS_CHANNELS.set, async (_event, raw) => {
+		const saved = await saveSettings(electron.app.getPath("userData"), raw);
+		pluginHost?.setDisabled(saved.disabledPlugins);
+		return saved;
 	});
 	registerToolchainIpc((progress) => sendToRenderer(TOOLCHAIN_CHANNELS.progress, progress), () => mainWindow);
 	const requireRoot = () => {
@@ -4754,199 +8177,9 @@ electron.app.whenReady().then(async () => {
 		return runProject(requireRoot(), compiler, request, executable, pythonExecutable);
 	});
 	electron.ipcMain.handle(SEARCH_CHANNELS.query, (_event, options) => searchWorkspace(requireRoot(), options));
-
-/**
- * 洛谷写题「测样例」：编译 → 喂样例输入 → 判定。
- * 判定：AC 通过 / WA 答案错误 / TLE 超时（题目时限，默认 1 秒）/ MLE 内存超限（128 MB）
- *      / OLE 输出超限（4 MB）/ RE 运行错误 / CE 编译失败 / UKE 未知错误 / RUN 仅运行
- *
- * 两个工程细节：
- * 1. 进程启动本身有开销（杀软扫描等），直接拿墙钟和时限比会误判 TLE。
- *    首次调用时测一次空进程启动耗时作为 allowance，阈值 = 时限 + allowance。
- * 2. 子进程峰值内存没有零成本接口，运行中途采样两次工作集（300ms / 800ms），取最大值。
- *    另外 bad_alloc / STATUS_NO_MEMORY 等明确内存信号也直接判 MLE。
- */
-const SAMPLE_TIME_LIMIT_MS = 1000;
-const SAMPLE_MEMORY_LIMIT_KB = 128 * 1024;
-const SAMPLE_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
-const SAMPLE_MEMORY_SAMPLES = [300, 800];
-let sparkleStartupAllowanceMs = 0;
-
-async function sparkleMeasureStartup() {
-	if (sparkleStartupAllowanceMs > 0) return sparkleStartupAllowanceMs;
-	const startedAt = Date.now();
-	await new Promise((resolve) => {
-		try {
-			const probe = (0, node_child_process).spawn(process.execPath, [`-e`, ``], { windowsHide: true, stdio: `ignore` });
-			probe.on(`close`, resolve);
-			probe.on(`error`, resolve);
-		} catch (e) { resolve(); }
-	});
-	sparkleStartupAllowanceMs = Math.min(Math.max(Date.now() - startedAt, 0), 4000);
-	return sparkleStartupAllowanceMs;
-}
-
-function sampleWorkingSet(pid) {
-	return new Promise((resolve) => {
-		(0, node_child_process).execFile(`tasklist`, [`/FI`, `PID eq ${pid}`, `/FO`, `CSV`, `/NH`], { windowsHide: true, timeout: 20000 }, (error, out) => {
-			if (error || !out) return resolve(0);
-			const line = String(out).trim().split(/\r?\n/)[0] || ``;
-			const cols = line.split(`","`);
-			const raw = cols.length >= 5 ? cols[cols.length - 1] : ``;
-			const kb = parseInt(String(raw).replace(/[^\d]/g, ``), 10);
-			resolve(Number.isFinite(kb) ? kb : 0);
-		});
-	});
-}
-
-function runSampleProcess(executable, directory, input, hardLimitMs, compiler) {
-	return new Promise((resolve) => {
-		const env = { ...process.env };
-		delete env.ELECTRON_RUN_AS_NODE;
-		if (compiler && compiler.binDir) prependPath(env, compiler.binDir);
-		let stdout = ``, stderr = ``, timedOut = false, ole = false, settled = false, peakKb = 0, spawnError = false;
-		const startedAt = Date.now();
-		const finish = (extra) => {
-			if (settled) return;
-			settled = true;
-			resolve({ code: -1, stdout, stderr, timedOut, ole, peakKb, spawnError, elapsedMs: Date.now() - startedAt, ...extra });
-		};
-		let child;
-		try {
-			child = (0, node_child_process).spawn(executable, [], { cwd: directory, env, windowsHide: true, stdio: [`pipe`, `pipe`, `pipe`] });
-		} catch (error) {
-			return finish({ stderr: String(error?.message ?? error), spawnError: true });
-		}
-		const kill = () => { try { child.kill(); } catch (e) { } };
-		const timer = setTimeout(() => { timedOut = true; kill(); }, hardLimitMs);
-		const probeTimers = SAMPLE_MEMORY_SAMPLES.map((at) => setTimeout(async () => {
-			if (settled || !child.pid) return;
-			const kb = await sampleWorkingSet(child.pid);
-			if (kb > peakKb) peakKb = kb;
-		}, at));
-		child.stdout.on(`data`, (chunk) => {
-			if (ole) return;
-			stdout += chunk.toString(`utf8`);
-			if (Buffer.byteLength(stdout, `utf8`) > SAMPLE_OUTPUT_LIMIT_BYTES) {
-				ole = true;
-				kill();
-			}
-		});
-		child.stderr.on(`data`, (chunk) => { if (stderr.length < 65536) stderr += chunk.toString(`utf8`); });
-		const cleanup = () => { clearTimeout(timer); probeTimers.forEach((t) => clearTimeout(t)); };
-		child.on(`close`, (code) => { cleanup(); finish({ code: code ?? -1 }); });
-		child.on(`error`, (error) => { cleanup(); finish({ stderr: stderr + String(error?.message ?? error), spawnError: true }); });
-		try {
-			child.stdin.write(String(input ?? ``));
-			child.stdin.end();
-		} catch (e) { }
-	});
-}
-
-async function runSample(root, compiler, request) {
-	const startedAt = Date.now();
-	const base = {
-		stdout: ``,
-		stderr: ``,
-		expected: String(request.expected ?? ``),
-		input: String(request.input ?? ``),
-		durationMs: 0,
-		memoryKb: 0
-	};
-	const compiled = await compileSingleFile(root, compiler, { path: request.path });
-	if (!compiled.ok) return {
-		...base,
-		verdict: `CE`,
-		message: compiled.friendlyError || `编译失败`,
-		stderr: compiled.output || ``,
-		durationMs: Date.now() - startedAt
-	};
-	const executable = compiled.executable;
-	const directory = (0, node_path.dirname)(executable);
-	const limit = Math.max(100, Number(request.timeLimitMs) || SAMPLE_TIME_LIMIT_MS);
-	const allowance = await sparkleMeasureStartup();
-	const hardLimit = limit + allowance;
-	const run = await runSampleProcess(executable, directory, request.input, hardLimit, compiler);
-	const normalize = (text) => String(text ?? ``).replace(/\r\n?/g, `\n`).split(`\n`).map((line) => line.replace(/[ \t]+$/g, ``)).join(`\n`).trim();
-	const expected = normalize(request.expected);
-	const actual = normalize(run.stdout);
-	const oomSignal = /bad_alloc|out of memory|cannot allocate|memory exhausted/i.test(run.stderr || ``);
-	const oomExit = run.code === 3221225495 || run.code === -1073741801; /* 0xC0000017 STATUS_NO_MEMORY */
-	let verdict;
-	if (run.spawnError) verdict = `UKE`;
-	else if (oomSignal || oomExit || run.peakKb > SAMPLE_MEMORY_LIMIT_KB) verdict = `MLE`;
-	else if (run.timedOut) verdict = `TLE`;
-	else if (run.ole) verdict = `OLE`;
-	else if (run.code !== 0) verdict = `RE`;
-	else if (!expected) verdict = `RUN`;
-	else if (actual === expected) verdict = `AC`;
-	else verdict = `WA`;
-	return {
-		...base,
-		verdict,
-		stdout: run.stdout,
-		stderr: run.stderr,
-		exitCode: run.code,
-		timedOut: run.timedOut,
-		memoryKb: run.peakKb || 0,
-		runMs: Math.max(0, run.elapsedMs - allowance),
-		durationMs: Date.now() - startedAt,
-		limits: { timeMs: limit, memoryKb: SAMPLE_MEMORY_LIMIT_KB, outputBytes: SAMPLE_OUTPUT_LIMIT_BYTES }
-	};
-}
-
-
 	electron.ipcMain.handle(IDE_CHANNELS.compileFile, (_event, request) => compileSingleFile(requireRoot(), currentCompiler(), request));
-	electron.ipcMain.handle("ide:runSample", async (_event, request) => {
-		try { return await runSample(requireRoot(), currentCompiler(), request ?? {}); }
-		catch (error) { return { verdict: "ERR", message: String(error?.message ?? error) }; }
-	});
 	electron.ipcMain.handle(IDE_CHANNELS.runFile, (_event, request) => runExecutable(requireRoot(), currentCompiler(), detect().find((tool) => tool.id === "python")?.path ?? "python", request));
 	electron.ipcMain.handle(IDE_CHANNELS.runInConsole, (_event, request) => runInConsole(requireRoot(), currentCompiler(), request.executable, request.language, detect().find((tool) => tool.id === "python")?.path ?? "python"));
-	electron.ipcMain.handle("luogu:search", (_event, options) => luoguSearchProblems(options ?? {}));
-	electron.ipcMain.handle("luogu:problem", (_event, pid) => luoguGetProblem(pid));
-	/** 打开洛谷题目页。只允许 https://www.luogu.com.cn/problem/<编号>，别处一律拒绝 */
-	electron.ipcMain.handle("luogu:openExternal", async (_event, url) => {
-		let parsed;
-		try {
-			parsed = new URL(String(url ?? ""));
-		} catch {
-			return { ok: false, error: "链接格式不对" };
-		}
-		if (parsed.protocol !== "https:" || parsed.hostname !== "www.luogu.com.cn" || !/^\/problem\/[A-Za-z]{1,3}[0-9][0-9A-Za-z]{0,7}$/.test(parsed.pathname)) return { ok: false, error: "只能打开洛谷题目页面" };
-		await electron.shell.openExternal(parsed.href);
-		return { ok: true };
-	});
-	electron.ipcMain.handle("settings:get", () => loadSettings());
-	electron.ipcMain.handle("settings:set", (_event, update) => saveSettings(update));
-	/** 关于信息（版本号、工作区、数据目录都给「设置」面板用） */
-	electron.ipcMain.handle("ide:appInfo", () => ({
-		version: electron.app.getVersion(),
-		electron: process.versions.electron,
-		chrome: process.versions.chrome,
-		node: process.versions.node,
-		workspace: currentWorkspace(),
-		userData: electron.app.getPath("userData")
-	}));
-	/** 在资源管理器里显示某个路径（设置面板「打开数据目录」用） */
-	electron.ipcMain.handle("ide:openPath", async (_event, target) => {
-		const path = String(target ?? "");
-		if (!path) return { ok: false, error: "路径为空" };
-		try {
-			if (!(0, node_fs.existsSync)(path)) return { ok: false, error: `路径不存在：${path}` };
-			const error = await electron.shell.openPath(path);
-			return error ? { ok: false, error } : { ok: true };
-		} catch (error) {
-			return { ok: false, error: String(error?.message ?? error) };
-		}
-	});
-	/** 不经对话框直接设定工作区（启动时恢复上次工作区用） */
-	electron.ipcMain.handle("ide:setWorkspace", (_event, directory) => {
-		const target = String(directory ?? "");
-		if (!target || !(0, node_fs.existsSync)(target) || !(0, node_fs.statSync)(target).isDirectory()) return { ok: false, error: `目录不存在：${target}` };
-		setWorkspaceRoot(target);
-		return { ok: true, workspace: currentWorkspace() };
-	});
 	/**
 	* 打开单个文件。
 	*
@@ -4954,11 +8187,19 @@ async function runSample(root, compiler, request) {
 	* 用户点「打开文件」的意图就是"我要弄这个文件"，
 	* 先让他自己去打开文件夹是多余的步骤。
 	*/
-	electron.ipcMain.handle(IDE_CHANNELS.openFileDialog, async () => {
+	electron.ipcMain.handle(IDE_CHANNELS.openFileDialog, async (_event, kind) => {
+		// kind === "pdf" 时只挑 PDF，别让对话框默认停在 cpp/cxx 上
+		const wantsPdf = String(kind || "") === "pdf";
 		const options = {
-			title: "打开文件",
+			title: wantsPdf ? "打开 PDF 文件" : "打开文件",
 			properties: ["openFile"],
-			filters: [{
+			filters: wantsPdf ? [{
+				name: "PDF 文件",
+				extensions: ["pdf"]
+			}, {
+				name: "所有文件",
+				extensions: ["*"]
+			}] : [{
 				name: "代码文件",
 				extensions: [
 					"cpp",
@@ -5031,6 +8272,7 @@ async function runSample(root, compiler, request) {
 	electron.ipcMain.handle(BENCH_CHANNELS.config, () => bench);
 	electron.ipcMain.on(BENCH_CHANNELS.mark, (_event, rendererMark) => recordRendererMark(rendererMark));
 	if (bench.workspace) setWorkspaceRoot(bench.workspace);
+	else restoreWorkspace();
 	createWindow();
 	mainWindow?.webContents.once("did-finish-load", () => {
 		setTimeout(() => {
@@ -5220,16 +8462,89 @@ async function runSample(root, compiler, request) {
 					}
 					await new Promise((resolve) => setTimeout(resolve, 800));
 					const afterText = await readVisibleText();
+					let undoRestored = false;
+					let undoText = "";
+					try {
+						mainWindow.webContents.sendInputEvent({
+							type: "keyDown",
+							keyCode: "z",
+							modifiers: ["control"]
+						});
+						mainWindow.webContents.sendInputEvent({
+							type: "keyUp",
+							keyCode: "z",
+							modifiers: ["control"]
+						});
+						await new Promise((resolve) => setTimeout(resolve, 600));
+						undoText = await readVisibleText();
+						undoRestored = undoText.includes("ZZZ") === false;
+					} catch {
+						undoRestored = false;
+					}
 					recordDiagnostic("typingTest", {
 						beforeLength: beforeText.length,
 						afterLength: afterText.length,
 						changed: beforeText !== afterText,
 						containsZZZ: afterText.includes("ZZZ"),
 						beforeSample: beforeText.slice(0, 120),
-						afterSample: afterText.slice(0, 120)
+						afterSample: afterText.slice(0, 120),
+						undoRestored,
+						undoLength: undoText.length,
+						undoStillHasZZZ: undoText.includes("ZZZ")
 					});
 				} catch (error) {
 					recordDiagnostic("typingTest", { error: error instanceof Error ? error.message : String(error) });
+				}
+				try {
+					recordDiagnostic("oiProbe", await mainWindow.webContents.executeJavaScript(`
+                (async () => {
+                  const api = window.sparkle?.plugin
+                  if (!api) return { ok: false, reason: 'window.sparkle.plugin 不存在' }
+                  const out = { ok: true }
+
+                  // 先拿状态：这一步不触发激活，能立刻看出插件是不是 error
+                  try {
+                    const listed = await api.list()
+                    out.plugins = (listed.plugins || []).map((p) => ({
+                      id: p.id,
+                      name: p.name,
+                      state: p.state,
+                      error: p.error || ''
+                    }))
+                  } catch (e) {
+                    out.listPluginsError = String((e && e.message) || e)
+                  }
+
+                  // 再问求解器，最多等 6 秒
+                  try {
+                    const solvers = await Promise.race([
+                      api.listSolvers(),
+                      new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('listSolvers 超时（6 秒）')), 6000)
+                      )
+                    ])
+                    out.count = Array.isArray(solvers) ? solvers.length : -1
+                    out.solvers = (solvers || []).slice(0, 15).map((s) => s.pluginId + ':' + s.id)
+                    out.byPlugin = {}
+                    for (const s of solvers || []) {
+                      out.byPlugin[s.pluginId] = (out.byPlugin[s.pluginId] || 0) + 1
+                    }
+                  } catch (e) {
+                    out.listError = String((e && e.message) || e)
+                  }
+
+                  const panel = document.querySelector('.oi-panel')
+                  if (panel) {
+                    out.panelText = panel.textContent.replace(/\\s+/g, ' ').trim().slice(0, 400)
+                  }
+                  return out
+                })()
+              `));
+				} catch (error) {
+					recordDiagnostic("oiProbe", {
+						ok: false,
+						reason: `探针失败：${error instanceof Error ? error.message : String(error)}`
+					});
 				}
 				try {
 					recordDiagnostic("editorProbe", await mainWindow.webContents.executeJavaScript(`
@@ -5285,6 +8600,221 @@ async function runSample(root, compiler, request) {
 						ok: false,
 						reason: `探针执行失败：${error instanceof Error ? error.message : String(error)}`
 					});
+				}
+				if (process.env.SPARKLE_BENCH_FORMAT === "1") try {
+					const beforeFormat = await mainWindow.webContents.executeJavaScript(`
+                  (async () => {
+                    const out = {}
+                    try {
+                      out.formatters = await window.sparkle.plugin.listFormatters()
+                    } catch (e) {
+                      out.formattersError = String((e && e.message) || e)
+                    }
+                    const btn = [...document.querySelectorAll('.editor-toolbar button')]
+                      .find((b) => (b.textContent || '').trim() === '格式化')
+                    out.hasButton = !!btn
+                    out.buttonDisabled = btn ? btn.disabled : null
+                    const read = () =>
+                      (document.querySelector('.monaco-editor .view-lines')?.textContent ?? '')
+                    out.before = read().slice(0, 200)
+
+                    // 先直接走一次 IPC，把失败原因抓出来（点按钮看不出原因）
+                    try {
+                      const model = read()
+                      const raw = await window.sparkle.plugin.formatDocument('cpp', model)
+                      out.ipcReturned = raw === null ? null : String(raw).slice(0, 120)
+                    } catch (e) {
+                      out.ipcError = String((e && e.message) || e)
+                    }
+
+                    if (btn) btn.click()
+                    await new Promise((r) => setTimeout(r, 3000))
+                    out.after = read().slice(0, 200)
+                    out.changed = out.before !== out.after
+                    // 面板上的提示（成功/失败都会写在这里）
+                    out.panelNote = (
+                      document.querySelector('.debug-panel .output')?.textContent ?? ''
+                    ).replace(/\\s+/g, ' ').trim().slice(0, 300)
+                    return out
+                  })()
+                `);
+					mainWindow.focus();
+					mainWindow.webContents.focus();
+					await new Promise((resolve) => setTimeout(resolve, 200));
+					mainWindow.webContents.sendInputEvent({
+						type: "keyDown",
+						keyCode: "z",
+						modifiers: ["control"]
+					});
+					mainWindow.webContents.sendInputEvent({
+						type: "keyUp",
+						keyCode: "z",
+						modifiers: ["control"]
+					});
+					await new Promise((resolve) => setTimeout(resolve, 700));
+					const afterUndo = await mainWindow.webContents.executeJavaScript(`(() => (document.querySelector('.monaco-editor .view-lines')?.textContent ?? '')).call(null).slice(0, 200)`);
+					recordDiagnostic("formatProbe", {
+						...beforeFormat,
+						afterUndo,
+						undoRestored: afterUndo === beforeFormat.before
+					});
+				} catch (error) {
+					recordDiagnostic("formatProbe", { error: error instanceof Error ? error.message : String(error) });
+				}
+				if (process.env.SPARKLE_BENCH_UI === "1") try {
+					recordDiagnostic("uiProbe", await mainWindow.webContents.executeJavaScript(`
+                  (async () => {
+                    const out = {}
+                    const $ = (sel) => document.querySelector(sel)
+
+                    // ── 1. 设置：读默认值 ──
+                    try {
+                      out.settings = await window.sparkle.settings.get()
+                    } catch (e) { out.settingsError = String((e && e.message) || e) }
+
+                    // ── 2. 设置面板能打开、主题能切 ──
+                    const beforeBg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+                    out.bgBefore = beforeBg
+                    document.querySelector('[data-view="settings"]')?.click()
+                    await new Promise((r) => setTimeout(r, 600))
+                    out.settingsPanelVisible = !!$('.settings-panel')
+                    out.themeCards = document.querySelectorAll('.theme-card').length
+
+                    // 点第二个主题（纯黑）
+                    const cards = document.querySelectorAll('.theme-card')
+                    if (cards.length > 1) {
+                      cards[1].click()
+                      await new Promise((r) => setTimeout(r, 600))
+                    }
+                    out.bgAfterTheme = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+                    out.themeChanged = out.bgBefore !== out.bgAfterTheme
+
+                    // ── 3. 字号能改 ──
+                    const sliders = document.querySelectorAll('.settings-panel input[type="range"]')
+                    out.sliderCount = sliders.length
+                    if (sliders.length > 0) {
+                      sliders[0].value = '20'
+                      sliders[0].dispatchEvent(new Event('input', { bubbles: true }))
+                      await new Promise((r) => setTimeout(r, 600))
+                      out.editorFontSizeSaved = (await window.sparkle.settings.get()).editorFontSize
+                    }
+
+                    // ── 4. 停用插件 → 侧边栏图标消失 ──
+                    // 必须走**界面上的复选框**，而不是直接调 IPC ——
+                    // 直接调 IPC 会绕过渲染层的设置 store，
+                    // 那样测出来的是"数据变了但界面没变"，和真实路径不同。
+                    const hadOiIcon = !!document.querySelector('[data-view="oi"]')
+                    out.oiIconBefore = hadOiIcon
+
+                    const rows = [...document.querySelectorAll('.plugin-row')]
+                    const oiRow = rows.find((r) => (r.textContent || '').includes('OI-Helper'))
+                    out.oiRowFound = !!oiRow
+                    const oiCheckbox = oiRow?.querySelector('input[type="checkbox"]')
+                    if (oiCheckbox) {
+                      oiCheckbox.checked = false
+                      oiCheckbox.dispatchEvent(new Event('change', { bubbles: true }))
+                      await new Promise((r) => setTimeout(r, 1200))
+                    }
+                    out.oiIconAfterDisable = !!document.querySelector('[data-view="oi"]')
+                    out.oiHidden = hadOiIcon && !out.oiIconAfterDisable
+
+                    // 再启用回来，确认能恢复
+                    if (oiCheckbox) {
+                      oiCheckbox.checked = true
+                      oiCheckbox.dispatchEvent(new Event('change', { bubbles: true }))
+                      await new Promise((r) => setTimeout(r, 1200))
+                    }
+                    out.oiIconRestored = !!document.querySelector('[data-view="oi"]')
+
+                    // ── 5. 命令面板 ──
+                    document.dispatchEvent(
+                      new KeyboardEvent('keydown', {
+                        key: 'P', ctrlKey: true, shiftKey: true, bubbles: true
+                      })
+                    )
+                    window.dispatchEvent(
+                      new KeyboardEvent('keydown', {
+                        key: 'p', ctrlKey: true, shiftKey: true, bubbles: true
+                      })
+                    )
+                    await new Promise((r) => setTimeout(r, 500))
+                    const palette = $('.palette')
+                    out.paletteOpened = !!palette
+                    out.paletteItems = document.querySelectorAll('.palette-item').length
+                    if (palette) {
+                      const input = $('.palette-input')
+                      if (input) {
+                        input.value = '格式'
+                        input.dispatchEvent(new Event('input', { bubbles: true }))
+                        await new Promise((r) => setTimeout(r, 400))
+                        out.afterFilterItems = document.querySelectorAll('.palette-item').length
+                        out.firstMatch = ($('.palette-item .item-title') || {}).textContent || ''
+                      }
+                    }
+                    return out
+                  })()
+                `));
+				} catch (error) {
+					recordDiagnostic("uiProbe", { error: error instanceof Error ? error.message : String(error) });
+				}
+				if (process.env.SPARKLE_BENCH_SPLIT === "1") try {
+					recordDiagnostic("splitProbe", await mainWindow.webContents.executeJavaScript(`
+                  (async () => {
+                    window.__sparkleKeepSplit = ${process.env.SPARKLE_BENCH_KEEP_SPLIT === "1" ? "true" : "false"}
+                    const out = {}
+                    const panes = () => document.querySelectorAll('.pane')
+                    const paneTitle = (i) => {
+                      const t = document.querySelectorAll('.pane-title')[i]
+                      return t ? t.textContent.trim() : ''
+                    }
+                    out.panesBefore = panes().length
+                    out.keepSplitFlag = window.__sparkleKeepSplit === true
+
+                    const btn = [...document.querySelectorAll('.editor-toolbar button')]
+                      .find((b) => (b.textContent || '').trim() === '分屏')
+                    out.hasSplitButton = !!btn
+                    if (btn) btn.click()
+                    await new Promise((r) => setTimeout(r, 900))
+                    out.panesAfterSplit = panes().length
+                    out.focusedCount = document.querySelectorAll('.pane.focused').length
+                    out.secondPaneHasWelcome = !!panes()[1]?.querySelector('.pane-welcome')
+
+                    // 在焦点窗格（第二个）里打开另一个文件：
+                    // 点文件树的行，走的是真实用户路径（FileTree → openFile → 观察者 → 焦点窗格）
+                    const otherFile = document.querySelector('[data-tree-path="b.py"]')
+                    out.foundSecondFile = !!otherFile
+                    if (otherFile) otherFile.click()
+                    await new Promise((r) => setTimeout(r, 1200))
+
+                    out.pane0Title = paneTitle(0)
+                    out.pane1Title = paneTitle(1)
+                    out.differentFiles =
+                      out.pane0Title !== '' &&
+                      out.pane1Title !== '' &&
+                      out.pane0Title !== out.pane1Title
+                    out.monacoInstances = document.querySelectorAll('.pane .monaco-editor').length
+
+                    const orientBtn = [...document.querySelectorAll('.editor-toolbar button')]
+                      .find((b) => ['⇅', '⇄'].includes((b.textContent || '').trim()))
+                    if (orientBtn) {
+                      orientBtn.click()
+                      await new Promise((r) => setTimeout(r, 600))
+                      out.orientationClass = document.querySelector('.panes')?.className || ''
+                    }
+
+                    const closeBtn = [...document.querySelectorAll('.editor-toolbar button')]
+                      .find((b) => (b.textContent || '').trim() === '关窗格')
+                    // 截图时用 SPARKLE_BENCH_KEEP_SPLIT=1 保留分屏状态
+                    if (closeBtn && !(window.__sparkleKeepSplit === true)) {
+                      closeBtn.click()
+                      await new Promise((r) => setTimeout(r, 700))
+                    }
+                    out.panesAfterClose = panes().length
+                    return out
+                  })()
+                `));
+				} catch (error) {
+					recordDiagnostic("splitProbe", { error: error instanceof Error ? error.message : String(error) });
 				}
 				const shotPath = process.env.SPARKLE_BENCH_SHOT;
 				if (shotPath) {

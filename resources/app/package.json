@@ -1,9 +1,8 @@
 {
   "name": "sparkle-ide",
   "productName": "Sparkle IDE",
-  "version": "1.0.3",
+  "version": "1.1.1",
   "private": true,
-  "description": "Sparkle IDE — 面向初学者的便携式 C++ IDE：类 VS Code 外壳 + 节点图 + 洛谷题库 + 预装编译器",
-  "main": "out/main/index.js",
-  "license": "MIT"
+  "description": "Sparkle IDE — 面向初学者的现代 IDE：类 VS Code 外壳 + 节点图 + AI + OI-Wiki",
+  "main": "out/main/index.js"
 }
